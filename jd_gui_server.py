@@ -273,7 +273,7 @@ HTML = r"""<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
-<title>京东抢购助手 v2026-07-23.3</title>
+<title>京东抢购助手 v2026-07-23.4</title>
 <style>
   :root{
     --bg:#f5f5f7; --card:#ffffff; --ink:#1d1d1f; --ink-2:#6e6e73; --line:#e8e8ed;
@@ -335,6 +335,9 @@ HTML = r"""<!DOCTYPE html>
   ul.tasks{ margin:6px 0 0; padding-left:18px; }
   ul.tasks li{ margin:3px 0; font-size:13px; }
   .footer{ text-align:center; margin:14px 0 4px; }
+  button.sm{ padding:7px 14px; font-size:13px; }
+  .status-actions{ margin-top:12px; flex-wrap:wrap; }
+  .buy-btn{ font-size:16px; padding:12px 26px; }
 </style>
 </head>
 <body>
@@ -343,85 +346,71 @@ HTML = r"""<!DOCTYPE html>
     <div class="logo">京</div>
     <div>
       <h1>京东抢购助手</h1>
-      <div class="sub">调试 Chrome 驱动 · 多账号切换 · 定时 / 并发下单</div>
+      <div class="sub">调试 Chrome 驱动 · 多账号 · 一键抢购</div>
     </div>
   </div>
 
+  <!-- 状态栏：自动轮询，无需手动刷新 -->
   <div class="card">
-    <h2><span class="step-badge">A</span>账号切换</h2>
-    <div class="row" style="align-items:center;">
-      <div class="seg" id="account-seg"></div>
-      <button class="ghost" onclick="addAccount()">+ 新增</button>
-    </div>
-    <div class="muted" id="account-hint" style="margin-top:11px;">正在读取账号…</div>
-    <div class="row" style="margin-top:10px;">
-      <button class="danger ghost" onclick="logoutAccount()">注销当前账号登录</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2><span class="step-badge">1</span>连接状态</h2>
     <div class="status" id="status">
       <span class="badge" id="b-account">账号：检测中…</span>
       <span class="badge" id="b-chrome">Chrome：检测中…</span>
       <span class="badge" id="b-login">登录态：检测中…</span>
       <span class="badge" id="b-checkout">结算页：检测中…</span>
-      <span class="badge" id="b-pay">收银台：检测中…</span>
     </div>
-    <div class="row" style="margin-top:14px;">
-      <button class="ghost" onclick="refreshStatus()">刷新状态</button>
-      <button class="ghost" onclick="launchChrome()">启动调试 Chrome</button>
-      <label class="switch"><input type="checkbox" id="headlessChk" checked> 后台无窗口</label>
+    <div class="row status-actions">
+      <button class="ghost sm" id="btn-launch" onclick="launchChrome()">启动调试 Chrome</button>
+      <button class="ghost sm" id="btn-login" onclick="openLogin()" style="display:none;">去登录</button>
+      <label class="switch"><input type="checkbox" id="headlessChk" checked onchange="onHeadlessChange()"> 后台无窗口</label>
+      <span class="muted" id="status-ts"></span>
     </div>
-    <pre id="out-launch" class="muted">—</pre>
+    <pre id="act-log" class="muted">—</pre>
   </div>
 
+  <!-- 账号切换 -->
   <div class="card">
-    <h2><span class="step-badge">2</span>登录（需手动完成）</h2>
-    <div class="muted">点击下方按钮会在调试 Chrome 打开京东登录页。请在弹出的浏览器窗口里完成短信/扫码登录（含验证码）。登录成功后会自动跳回结算页。<b>当前为后台无窗口模式时，点此按钮会自动临时切换为窗口模式</b>以便你操作；登录完成后可在①区勾选「后台无窗口」切回，登录态不丢。<br>商品 SKU / 数量在下方「④ 提交订单」里统一设置，本步骤无需填写。</div>
-    <div class="row" style="margin-top:12px;">
-      <button onclick="openLogin()">打开登录页（需窗口操作）</button>
+    <h2>账号</h2>
+    <div class="row" style="align-items:center;">
+      <div class="seg" id="account-seg"></div>
+      <button class="ghost" onclick="addAccount()">+ 新增</button>
+      <button class="danger ghost" onclick="logoutAccount()">注销登录</button>
     </div>
-    <pre id="out-login" class="muted">—</pre>
+    <div class="muted" id="account-hint" style="margin-top:10px;">正在读取账号…</div>
   </div>
 
+  <!-- 抢购面板（原 ②③ ④ 合并为一步） -->
   <div class="card">
-    <h2><span class="step-badge">3</span>打开结算页并核对</h2>
-    <div class="muted">使用「④ 提交订单」里的 SKU / 数量打开结算页并读取商品信息核对（不会下单）。</div>
+    <h2>🚀 抢购</h2>
+    <div class="muted">粘贴分享链接自动解析 SKU，或手动填 SKU。点「立即抢购」会<b>自动打开结算页并下单</b>（无需先单独核对）。</div>
     <div class="row" style="margin-top:12px;">
-      <button onclick="doCheckout()">打开并核对</button>
-      <button class="ghost" onclick="doCheckoutRetry()">重试（风控冷却后）</button>
-    </div>
-    <div id="checkout-result" class="kv" style="margin-top:12px;">—</div>
-  </div>
-
-  <div class="card">
-    <h2><span class="step-badge">4</span>提交订单（真实下单 · 线程池 / 定时）</h2>
-    <div class="muted">点击后会真实提交订单并跳转到京东收银台。<b>会产生订单（需支付）</b>。生成后请去手机/电脑收银台完成付款。</div>
-    <div class="grid2" style="margin-top:12px;">
-      <input type="text" id="sku4" placeholder="SKU（京东商品编号）" value="100342780502" title="京东商品编号，抢不同商品时改成对应编号">
-      <input type="text" id="qty4" placeholder="数量" value="1" title="购买件数，多件改大">
-      <input type="text" id="conc4" placeholder="并发数" value="1" title="同时尝试次数。>1 会生成多笔订单，仅抢购高并发时使用">
-      <input type="text" id="retry4" placeholder="重试" value="0" title="首次失败后的重试次数">
-    </div>
-    <div class="muted" style="margin-top:8px;">
-      SKU：京东商品编号 ｜ 数量：购买件数 ｜ 并发数：同一时刻点击次数（&gt;1 会生成多笔订单，一般保持 1）｜ 重试：首次失败后的重试次数（一般保持 0）
-    </div>
-    <div class="row" style="margin-top:12px;">
-      <input type="text" id="shareLink" placeholder="粘贴京东分享短链(3.cn/…)或商品页链接，自动解析 SKU">
+      <input type="text" id="shareLink" placeholder="粘贴京东分享短链 / 商品页链接，自动解析 SKU">
       <button class="ghost" onclick="resolveLink()">解析链接</button>
-      <div class="muted" id="resolve-hint">支持 3.cn 短链 / item.jd.com 链接 / 直接填 SKU 数字</div>
+    </div>
+    <div class="muted" id="resolve-hint" style="margin-top:6px;">支持 3.cn 短链 / item.jd.com 链接 / 直接填 SKU 数字</div>
+    <div class="grid2" style="margin-top:12px;">
+      <input type="text" id="sku4" placeholder="SKU（京东商品编号）" value="100342780502">
+      <input type="text" id="qty4" placeholder="数量" value="1">
+      <input type="text" id="conc4" placeholder="并发数（一般 1）" value="1">
+      <input type="text" id="retry4" placeholder="重试次数（一般 0）" value="0">
     </div>
     <div class="row" style="margin-top:14px;">
-      <button class="danger" onclick="doSubmit()">立即提交</button>
-      <input type="text" id="at4" placeholder="定时时间，如 20:00 或 2026-07-22 20:00:00">
-      <button class="ghost" onclick="scheduleSubmit()">定时提交</button>
-      <button class="ghost" onclick="refreshTasks()">刷新任务</button>
+      <button class="danger buy-btn" id="btn-buy" onclick="doSubmit()">🚀 立即抢购</button>
+      <button class="ghost" onclick="doCheckout()">仅打开结算页核对</button>
+      <input type="text" id="at4" placeholder="定时时间，如 20:00">
+      <button class="ghost" onclick="scheduleSubmit()">⏰ 定时抢购</button>
     </div>
-    <div class="note">⚠️ 并发数 &gt; 1 会在同一时刻多次点击提交，可能生成多笔订单；定时提交到点由后台线程池自动执行，页面关掉也不影响。</div>
-    <div class="muted" style="margin-top:8px;">定时任务：</div>
-    <ul class="tasks" id="tasks"><li class="muted">无</li></ul>
+    <div class="note">⚠️ 立即抢购会真实提交订单并跳转收银台（<b>会产生订单需支付</b>）。并发数&gt;1 可能生成多笔订单；定时抢购到点由后台自动执行，关掉页面也不影响。</div>
+    <div id="checkout-result" class="kv" style="margin-top:12px;"></div>
     <pre id="out-submit">—</pre>
+  </div>
+
+  <!-- 定时任务 -->
+  <div class="card">
+    <h2>定时任务</h2>
+    <div class="row" style="margin-top:4px;">
+      <button class="ghost sm" onclick="refreshTasks()">刷新任务</button>
+    </div>
+    <ul class="tasks" id="tasks" style="margin-top:8px;"><li class="muted">无</li></ul>
   </div>
 
   <div class="muted footer">原脚本 jd_direct_order.py / raw_click.py 已保留，可命令行使用。</div>
@@ -441,14 +430,36 @@ async function refreshStatus(){
     setBadge('b-chrome', 'Chrome：'+(d.chrome_connected?'已连接':'未连接'), d.chrome_connected, !d.chrome_connected);
     setBadge('b-login', '登录态：'+(d.logged_in?'已登录':'未登录'), d.logged_in, !d.logged_in);
     setBadge('b-checkout', '结算页：'+(d.has_checkout?'已打开':'未打开'), d.has_checkout, !d.has_checkout);
-    setBadge('b-pay', '收银台：'+(d.has_payment?'已打开':'未打开'), d.has_payment, !d.has_payment);
     if(d.active_account){
       jd_active_account = d.active_account;
       setBadge('b-account', '当前账号：'+d.active_account, d.logged_in, !d.logged_in);
     }
+    updateStatusActions(d);
+    const ts=document.getElementById('status-ts');
+    if(ts) ts.textContent='状态更新于 '+new Date().toLocaleTimeString();
     if(d.detail) console.log(d.detail);
-  }catch(e){ alert('状态检测失败：'+e); }
+  }catch(e){
+    const ts=document.getElementById('status-ts');
+    if(ts) ts.textContent='状态获取失败：'+e;
+  }
 }
+
+// 根据状态上下文自动显隐「启动 Chrome / 去登录」按钮，减少多余操作
+function updateStatusActions(d){
+  const launch=document.getElementById('btn-launch');
+  const login=document.getElementById('btn-login');
+  if(!launch||!login) return;
+  if(!d.chrome_connected){
+    launch.style.display=''; login.style.display='none';
+  } else if(!d.logged_in){
+    launch.style.display=''; login.style.display='';
+  } else {
+    launch.style.display=''; login.style.display='none';
+  }
+}
+// 切换「后台无窗口」即重启调试 Chrome 切换窗口模式（登录态保留在 states/）
+function onHeadlessChange(){ launchChrome(); }
+
 async function api(path, body){
   // 用 text() 拿原始响应体（无论后端返回 JSON / HTML 错误页 / 被中间设备改写的内容）
   const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
@@ -574,23 +585,23 @@ async function resolveLink(){
   }
 }
 async function launchChrome(){
-  const o = document.getElementById('out-launch');
-  o.className=''; o.textContent='启动中…';
+  const o = document.getElementById('act-log');
+  if(o){ o.className=''; o.textContent='启动调试 Chrome 中…'; }
   const headless = document.getElementById('headlessChk').checked;
   try{
     const d = await api('/api/launch_chrome', {headless: headless});
-    o.textContent = JSON.stringify(d, null, 2);
+    if(o) o.textContent = JSON.stringify(d, null, 2);
     if(d.ok){ jd_headless = headless; setTimeout(refreshStatus, 1500); }
-  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+  }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
 }
 async function openLogin(){
-  const o = document.getElementById('out-login');
-  o.className=''; o.textContent='打开中…';
+  const o = document.getElementById('act-log');
+  if(o){ o.className=''; o.textContent='正在打开登录页（请在弹出的窗口完成登录）…'; }
   try{
     const d = await api('/api/open_login', {sku:getSku(), qty:getQty()});
-    o.textContent = JSON.stringify(d, null, 2);
+    if(o) o.textContent = JSON.stringify(d, null, 2);
     refreshStatus();
-  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+  }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
 }
 async function doCheckout(){
   const box = document.getElementById('checkout-result');
@@ -634,17 +645,20 @@ function renderCheckout(box, d){
 }
 async function doSubmit(){
   const o = document.getElementById('out-submit');
-  o.className=''; o.textContent='线程池提交中…';
+  const btn = document.getElementById('btn-buy');
+  if(btn) btn.disabled = true;
+  if(o){ o.className=''; o.textContent='抢购中（自动打开结算页并提交）…'; }
   try{
     const d = await api('/api/submit', {
-      sku: val('sku4')||'100342780502',
-      qty: parseInt(val('qty4')||'1'),
+      sku: getSku(),
+      qty: getQty(),
       concurrency: parseInt(val('conc4')||'1'),
       retries: parseInt(val('retry4')||'0')
     });
-    o.textContent = JSON.stringify(d, null, 2);
+    if(o) o.textContent = JSON.stringify(d, null, 2);
     refreshStatus(); refreshTasks();
-  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+  }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
+  finally{ if(btn) btn.disabled = false; }
 }
 async function scheduleSubmit(){
   const at = val('at4');
@@ -695,6 +709,9 @@ async function cancelSubmit(id){
 refreshStatus();
 refreshTasks();
 loadAccounts();
+// 状态与任务自动轮询，无需手动刷新
+setInterval(refreshStatus, 3000);
+setInterval(refreshTasks, 5000);
 </script>
 </body>
 </html>
