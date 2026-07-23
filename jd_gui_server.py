@@ -137,11 +137,17 @@ def parse_schedule_time(s):
 
 
 def _do_submit(sku, qty, retries=0):
-    """单次提交（带重试）。retry 之间不重开结算页。"""
+    """单次提交（带重试）。优先复用已有结算页直接点击，失败再兜底刷新结算页。
+
+    立即提交 常见路径：用户已点过「打开并核对」，结算页已存在，直接点击即可，
+    避免每次 submit 都重新 checkout（耗时可达 ~25s）。
+    """
     last = None
-    for attempt in range(1 + max(0, retries)):
+    attempts = 1 + max(0, retries)
+    for attempt in range(attempts):
         try:
-            r = jd.submit_order(sku, qty, ensure_checkout=(attempt == 0))
+            # 第 0 次先尝试复用已有结算页（最快）；后续/兜底再 ensure_checkout
+            r = jd.submit_order(sku, qty, ensure_checkout=(attempt > 0))
             if r.get("ok"):
                 return r
             last = r
@@ -149,6 +155,15 @@ def _do_submit(sku, qty, retries=0):
             last = {"ok": False, "error": str(e)}
         if attempt < retries:
             time.sleep(0.5)
+    # retries=0 且快路径失败时，兜底再尝试一次刷新结算页
+    if retries == 0 and last and not last.get("ok"):
+        try:
+            r = jd.submit_order(sku, qty, ensure_checkout=True)
+            if r.get("ok"):
+                return r
+            last = r
+        except Exception as e:
+            last = {"ok": False, "error": str(e)}
     return last or {"ok": False, "error": "提交失败"}
 
 
