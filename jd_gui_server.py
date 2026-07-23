@@ -11,7 +11,9 @@
 - ① 启动调试 Chrome 按钮（未连接时一键拉起）
 - 已移除 ⑤确认付款、⑥页面预览（用户在手机端付款）
 """
+import atexit
 import json
+import queue
 import threading
 import time
 import concurrent.futures
@@ -53,6 +55,57 @@ _TASK_ID = [0]
 # 当前调试 Chrome 模式（True=后台无窗口），用于自动切换
 CURRENT_HEADLESS = {"val": True}
 
+# ---- Playwright 同步 API 单线程 worker（greenlet 不支持跨线程切换）----
+# 所有浏览器操作统一交给该 worker 执行；HTTP 请求线程通过 browser_call 提交并等待结果。
+_BROWSER_Q = queue.Queue()
+
+
+def _browser_worker_loop():
+    while True:
+        task = _BROWSER_Q.get()
+        if task is None:
+            break
+        result_q, func, args, kwargs = task
+        try:
+            result_q.put((True, func(*args, **kwargs)))
+        except Exception as e:
+            import traceback
+            result_q.put((False, {"ok": False, "error": str(e),
+                                  "trace": traceback.format_exc()[-500:]}))
+
+
+_BROWSER_THREAD = threading.Thread(target=_browser_worker_loop, daemon=True, name="browser-worker")
+_BROWSER_THREAD.start()
+
+
+def browser_call(func, *args, timeout=35):
+    """把 func(*args) 放到 Playwright 专属线程执行并等待结果。"""
+    result_q = queue.Queue()
+    _BROWSER_Q.put((result_q, func, args, {}))
+    try:
+        ok, value = result_q.get(timeout=timeout)
+    except queue.Empty:
+        return {"ok": False, "error": "操作超时"}
+    if not ok:
+        return value
+    return value
+
+
+def _shutdown_browser():
+    """进程退出前：在 worker 线程里安全地保存登录态并关闭浏览器。"""
+    try:
+        browser_call(jd.close_debug_chrome, timeout=15)
+    except Exception:
+        pass
+
+
+# 用本文件自己的安全关闭逻辑替换 jd_cdp 中可能跨线程的 atexit 处理器
+try:
+    atexit.unregister(jd._atexit_save)
+except Exception:
+    pass
+atexit.register(_shutdown_browser)
+
 
 # ---------------------------------------------------------------------------
 # 定时提交相关
@@ -83,13 +136,6 @@ def parse_schedule_time(s):
     raise ValueError("无法解析时间，支持格式示例：2026-07-22 20:00:00 或 20:00")
 
 
-def _single_click_submit(sku, qty, idx):
-    """并发场景下单个点击尝试（错峰，避免同时抢同一连接）。"""
-    if idx > 0:
-        time.sleep(0.15 * idx)
-    return jd.submit_order(sku, qty, ensure_checkout=False)
-
-
 def _do_submit(sku, qty, retries=0):
     """单次提交（带重试）。retry 之间不重开结算页。"""
     last = None
@@ -107,24 +153,24 @@ def _do_submit(sku, qty, retries=0):
 
 
 def _fire(sku, qty, concurrency, retries):
-    """实际开火：并发数<=1 走单次+重试；>1 先开一次结算页再错峰并发点击。"""
+    """实际开火：并发数<=1 走单次+重试；>1 先开一次结算页再在 worker 线程内顺序快速点击。"""
     if concurrency <= 1:
         return _do_submit(sku, qty, retries)
     try:
         jd.checkout(sku, qty)
     except Exception as e:
         return {"ok": False, "error": f"打开结算页失败: {e}"}
-    futures = [EXECUTOR.submit(_single_click_submit, sku, qty, i)
-               for i in range(concurrency)]
     results = []
-    for f in futures:
+    for i in range(concurrency):
+        if i > 0:
+            time.sleep(0.15 * i)  # 错峰，避免同一瞬间重复提交
         try:
-            results.append(f.result(timeout=40))
+            r = jd.submit_order(sku, qty, ensure_checkout=False)
         except Exception as e:
-            results.append({"ok": False, "error": str(e)})
-    ok = next((r for r in results if r.get("ok")), None)
-    if ok:
-        return ok
+            r = {"ok": False, "error": str(e)}
+        results.append(r)
+        if r.get("ok"):
+            return r
     return {"ok": False, "error": "并发提交均未成功", "details": results}
 
 
@@ -148,7 +194,7 @@ def _run_scheduled(task):
             SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
             return
         SCHEDULED[tid]["status"] = "running"
-    res = _fire(task["sku"], task["qty"], task["concurrency"], task["retries"])
+    res = browser_call(_fire, task["sku"], task["qty"], task["concurrency"], task["retries"], timeout=80)
     with SCHED_LOCK:
         SCHEDULED[tid]["status"] = "done" if res.get("ok") else "error"
         SCHEDULED[tid]["result"] = res
@@ -674,21 +720,8 @@ class Handler(BaseHTTPRequestHandler):
             data = {}
 
         def run(func, *a, timeout=35):
-            # 在子线程里跑阻塞的 CDP 操作，避免卡主 server
-            res = {}
-
-            def worker():
-                try:
-                    res["v"] = func(*a)
-                except Exception as e:
-                    import traceback
-                    res["v"] = {"ok": False, "error": str(e),
-                                "trace": traceback.format_exc()[-500:]}
-
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            t.join(timeout=timeout)
-            return res.get("v", {"ok": False, "error": "操作超时"})
+            # 所有浏览器操作统一交给单线程 Playwright worker，避免 greenlet 跨线程错误
+            return browser_call(func, *a, timeout=timeout)
 
         try:
             if self.path == "/api/status":
@@ -704,7 +737,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/open_login":
                 # 登录需肉眼操作验证码 → 若当前无窗口，先切到窗口模式
                 if CURRENT_HEADLESS["val"]:
-                    jd.restart_debug_chrome(False)
+                    run(jd.restart_debug_chrome, False)
                     CURRENT_HEADLESS["val"] = False
                 v = run(jd.open_login_page, data.get("sku", "100342780502"),
                         int(data.get("qty", 1)))
