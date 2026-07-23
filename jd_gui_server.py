@@ -1,0 +1,767 @@
+"""
+京东抢购 GUI 服务（本地网页界面）。
+
+运行：python jd_gui_server.py  →  浏览器打开 http://127.0.0.1:8899
+依赖：仅标准库 + websocket-client（已在 venv 中）。
+底层下单逻辑见 jd_cdp.py（原生 CDP 方案，已验证可靠）。
+原脚本 jd_direct_order.py / raw_click.py / open_login.py 等保持不变。
+
+新增能力（用户要求）：
+- ④ 提交订单：线程池执行 + 固定时间点定时提交 + 页面可配置参数（SKU/数量/并发数/重试/定时时间）
+- ① 启动调试 Chrome 按钮（未连接时一键拉起）
+- 已移除 ⑤确认付款、⑥页面预览（用户在手机端付款）
+"""
+import json
+import threading
+import time
+import concurrent.futures
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import jd_cdp as jd
+import logging
+
+# ---- 请求级日志：同时写文件 jd_gui.log 与 stdout，便于排查 ----
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler("jd_gui.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("jd_gui")
+
+
+def _summ(v):
+    """把大响应 dict 压成关键字段，避免日志刷屏。"""
+    if isinstance(v, dict):
+        keys = ("ok", "error", "sku", "from", "status",
+                "chrome_connected", "logged_in", "has_checkout", "has_payment")
+        return {k: v.get(k) for k in keys if k in v}
+    return v
+
+
+PORT = 8899
+
+# 线程池：执行实际的提交动作（短任务）。定时等待用独立 daemon 线程，不占池。
+EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+# 定时任务登记表
+SCHED_LOCK = threading.Lock()
+SCHEDULED = {}
+_TASK_ID = [0]
+# 当前调试 Chrome 模式（True=后台无窗口），用于自动切换
+CURRENT_HEADLESS = {"val": True}
+
+
+# ---------------------------------------------------------------------------
+# 定时提交相关
+# ---------------------------------------------------------------------------
+def parse_schedule_time(s):
+    """解析用户时间串 → datetime。支持：
+       2026-07-22 20:00:00 / 2026-07-22 20:00
+       2026/07/22 20:00:00
+       20:00 / 20:00:00（默认今天，已过则顺延明天）
+    """
+    s = (s or "").strip()
+    now = datetime.now()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            t = datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+        d = now.replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=0)
+        if d < now:
+            d += timedelta(days=1)
+        return d
+    raise ValueError("无法解析时间，支持格式示例：2026-07-22 20:00:00 或 20:00")
+
+
+def _single_click_submit(sku, qty, idx):
+    """并发场景下单个点击尝试（错峰，避免同时抢同一连接）。"""
+    if idx > 0:
+        time.sleep(0.15 * idx)
+    return jd.submit_order(sku, qty, ensure_checkout=False)
+
+
+def _do_submit(sku, qty, retries=0):
+    """单次提交（带重试）。retry 之间不重开结算页。"""
+    last = None
+    for attempt in range(1 + max(0, retries)):
+        try:
+            r = jd.submit_order(sku, qty, ensure_checkout=(attempt == 0))
+            if r.get("ok"):
+                return r
+            last = r
+        except Exception as e:
+            last = {"ok": False, "error": str(e)}
+        if attempt < retries:
+            time.sleep(0.5)
+    return last or {"ok": False, "error": "提交失败"}
+
+
+def _fire(sku, qty, concurrency, retries):
+    """实际开火：并发数<=1 走单次+重试；>1 先开一次结算页再错峰并发点击。"""
+    if concurrency <= 1:
+        return _do_submit(sku, qty, retries)
+    try:
+        jd.checkout(sku, qty)
+    except Exception as e:
+        return {"ok": False, "error": f"打开结算页失败: {e}"}
+    futures = [EXECUTOR.submit(_single_click_submit, sku, qty, i)
+               for i in range(concurrency)]
+    results = []
+    for f in futures:
+        try:
+            results.append(f.result(timeout=40))
+        except Exception as e:
+            results.append({"ok": False, "error": str(e)})
+    ok = next((r for r in results if r.get("ok")), None)
+    if ok:
+        return ok
+    return {"ok": False, "error": "并发提交均未成功", "details": results}
+
+
+def _run_scheduled(task):
+    """定时线程：睡到目标时间 → 开火。可被取消标记中断。"""
+    tid = task["id"]
+    delay = (task["at"] - datetime.now()).total_seconds()
+    slept = 0.0
+    while slept < delay:
+        with SCHED_LOCK:
+            if SCHEDULED.get(tid, {}).get("cancelled"):
+                SCHEDULED[tid]["status"] = "cancelled"
+                SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
+                return
+        step = min(1.0, delay - slept)
+        time.sleep(step)
+        slept += step
+    with SCHED_LOCK:
+        if SCHEDULED.get(tid, {}).get("cancelled"):
+            SCHEDULED[tid]["status"] = "cancelled"
+            SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
+            return
+        SCHEDULED[tid]["status"] = "running"
+    res = _fire(task["sku"], task["qty"], task["concurrency"], task["retries"])
+    with SCHED_LOCK:
+        SCHEDULED[tid]["status"] = "done" if res.get("ok") else "error"
+        SCHEDULED[tid]["result"] = res
+
+
+def schedule_submit(data):
+    sku = str(data.get("sku", "100342780502"))
+    qty = int(data.get("qty", 1))
+    conc = max(1, int(data.get("concurrency", 1)))
+    retries = max(0, int(data.get("retries", 0)))
+    at = parse_schedule_time(data.get("at", ""))
+    if at <= datetime.now():
+        raise ValueError("定时必须晚于当前时间")
+    with SCHED_LOCK:
+        _TASK_ID[0] += 1
+        tid = f"T{_TASK_ID[0]:03d}"
+        task = {
+            "id": tid, "sku": sku, "qty": qty, "concurrency": conc,
+            "retries": retries, "at": at,
+            "at_str": at.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "pending", "result": None,
+            "created": datetime.now().strftime("%H:%M:%S"),
+        }
+        SCHEDULED[tid] = task
+    threading.Thread(target=_run_scheduled, args=(task,), daemon=True).start()
+    return {"ok": True, "task_id": tid, "at": task["at_str"],
+            "message": f"已安排在 {task['at_str']} 提交（并发 {conc}，重试 {retries}）"}
+
+
+def list_tasks():
+    with SCHED_LOCK:
+        items = []
+        for t in SCHEDULED.values():
+            item = dict(t)
+            item["at"] = t["at"].strftime("%Y-%m-%d %H:%M:%S")
+            items.append(item)
+        items.sort(key=lambda x: x["at_str"], reverse=True)
+        return {"ok": True, "tasks": items}
+
+
+def cancel_task(tid):
+    with SCHED_LOCK:
+        t = SCHEDULED.get(tid)
+        if not t:
+            return {"ok": False, "error": "任务不存在"}
+        if t["status"] in ("done", "error"):
+            return {"ok": False, "error": "任务已结束，无法取消"}
+        t["cancelled"] = True
+        t["status"] = "cancelled"
+        return {"ok": True, "message": f"已取消 {tid}"}
+
+
+# ---------------------------------------------------------------------------
+# 前端页面
+# ---------------------------------------------------------------------------
+HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>京东抢购助手 v2026-07-23.3</title>
+<style>
+  :root{
+    --bg:#f5f5f7; --card:#ffffff; --ink:#1d1d1f; --ink-2:#6e6e73; --line:#e8e8ed;
+    --blue:#0071e3; --blue-press:#0077ed; --red:#ff3b30; --red-press:#ff453a;
+    --green:#34c759; --gray-6:#8e8e93; --radius:18px;
+    --shadow:0 1px 3px rgba(0,0,0,.04), 0 10px 30px rgba(0,0,0,.05);
+  }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","PingFang SC","Helvetica Neue",sans-serif;
+        background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased; line-height:1.5; }
+  .wrap{ max-width:760px; margin:0 auto; padding:28px 18px 60px; }
+  .app-header{ display:flex; align-items:center; gap:13px; margin:4px 0 22px; }
+  .app-header .logo{ width:42px; height:42px; border-radius:12px; background:linear-gradient(135deg,#ff7a7a,#e1251b);
+        display:flex; align-items:center; justify-content:center; color:#fff; font-weight:700; font-size:21px;
+        box-shadow:0 6px 16px rgba(225,37,27,.28); }
+  .app-header h1{ font-size:23px; font-weight:700; letter-spacing:-.02em; margin:0; }
+  .app-header .sub{ font-size:13px; color:var(--ink-2); margin-top:2px; }
+  .card{ background:var(--card); border-radius:var(--radius); padding:20px; margin-bottom:16px; box-shadow:var(--shadow); }
+  .card h2{ font-size:17px; font-weight:600; margin:0 0 14px; letter-spacing:-.01em; display:flex; align-items:center; }
+  .step-badge{ display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 7px;
+        border-radius:50%; background:var(--blue); color:#fff; font-size:12px; font-weight:600; margin-right:10px; }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .grid2{ display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  @media(max-width:520px){ .grid2{ grid-template-columns:1fr; } }
+  input[type=text]{ padding:11px 14px; border:1px solid var(--line); border-radius:12px; font-size:15px; flex:1; min-width:120px;
+        background:#fbfbfd; outline:none; transition:border-color .2s, box-shadow .2s, background .2s; }
+  input[type=text]:focus{ border-color:var(--blue); box-shadow:0 0 0 4px rgba(0,113,227,.12); background:#fff; }
+  button{ font-family:inherit; background:var(--blue); color:#fff; border:none; border-radius:980px; padding:11px 20px;
+        font-size:15px; font-weight:500; cursor:pointer; transition:transform .12s, background .2s, box-shadow .2s; }
+  button:hover{ background:var(--blue-press); }
+  button:active{ transform:scale(.97); }
+  button.ghost{ background:#f0f0f3; color:var(--ink); }
+  button.ghost:hover{ background:#e6e6ea; }
+  button.danger{ background:var(--red); }
+  button.danger:hover{ background:var(--red-press); }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  .switch{ display:inline-flex; align-items:center; gap:6px; cursor:pointer; color:var(--ink-2); font-size:13px; }
+  .status{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .badge{ font-size:12.5px; font-weight:500; padding:5px 13px; border-radius:980px; background:#f0f0f3; color:var(--ink-2); transition:all .2s; }
+  .badge.on{ background:rgba(52,199,89,.15); color:#1c7c34; }
+  .badge.off{ background:rgba(255,59,48,.13); color:#c9342b; }
+  pre{ white-space:pre-wrap; word-break:break-all; background:#fafafa; border:1px solid var(--line); border-radius:12px;
+        padding:11px; font-size:13px; max-height:260px; overflow:auto; margin:8px 0 0; }
+  .kv{ font-size:14px; line-height:1.9; }
+  .kv b{ color:var(--red); }
+  .ok{ color:var(--green); }
+  .err{ color:var(--red); }
+  .muted{ color:var(--ink-2); font-size:12.5px; }
+  #resolve-hint{ white-space:pre-wrap; word-break:break-all; line-height:1.5; max-height:200px; overflow:auto; }
+  #resolve-hint.err{ color:var(--red); }
+  #resolve-hint.ok{ color:var(--green); }
+  .note{ font-size:12.5px; color:#8a6d3b; background:#fff8e9; border:1px solid #f3e2bd; padding:10px 12px; border-radius:12px; margin-top:12px; line-height:1.6; }
+  .seg{ display:inline-flex; background:#e8e8ed; border-radius:980px; padding:3px; gap:2px; flex-wrap:wrap; max-width:100%; }
+  .seg button{ border:none; background:transparent; color:var(--ink-2); border-radius:980px; padding:7px 16px;
+        font-size:14px; font-weight:500; cursor:pointer; transition:all .2s; }
+  .seg button:hover{ color:var(--ink); }
+  .seg button.active{ background:#fff; color:var(--ink); box-shadow:0 1px 4px rgba(0,0,0,.12); }
+  .seg button.add{ color:var(--blue); font-weight:600; }
+  ul.tasks{ margin:6px 0 0; padding-left:18px; }
+  ul.tasks li{ margin:3px 0; font-size:13px; }
+  .footer{ text-align:center; margin:14px 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="app-header">
+    <div class="logo">京</div>
+    <div>
+      <h1>京东抢购助手</h1>
+      <div class="sub">调试 Chrome 驱动 · 多账号切换 · 定时 / 并发下单</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step-badge">A</span>账号切换</h2>
+    <div class="row" style="align-items:center;">
+      <div class="seg" id="account-seg"></div>
+      <button class="ghost" onclick="addAccount()">+ 新增</button>
+    </div>
+    <div class="muted" id="account-hint" style="margin-top:11px;">正在读取账号…</div>
+    <div class="row" style="margin-top:10px;">
+      <button class="danger ghost" onclick="logoutAccount()">注销当前账号登录</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step-badge">1</span>连接状态</h2>
+    <div class="status" id="status">
+      <span class="badge" id="b-account">账号：检测中…</span>
+      <span class="badge" id="b-chrome">Chrome：检测中…</span>
+      <span class="badge" id="b-login">登录态：检测中…</span>
+      <span class="badge" id="b-checkout">结算页：检测中…</span>
+      <span class="badge" id="b-pay">收银台：检测中…</span>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button class="ghost" onclick="refreshStatus()">刷新状态</button>
+      <button class="ghost" onclick="launchChrome()">启动调试 Chrome</button>
+      <label class="switch"><input type="checkbox" id="headlessChk" checked> 后台无窗口</label>
+    </div>
+    <pre id="out-launch" class="muted">—</pre>
+  </div>
+
+  <div class="card">
+    <h2><span class="step-badge">2</span>登录（需手动完成）</h2>
+    <div class="muted">点击下方按钮会在调试 Chrome 打开京东登录页。请在弹出的浏览器窗口里完成短信/扫码登录（含验证码）。登录成功后会自动跳回结算页。<b>当前为后台无窗口模式时，点此按钮会自动临时切换为窗口模式</b>以便你操作；登录完成后可在①区勾选「后台无窗口」切回，登录态不丢。<br>商品 SKU / 数量在下方「④ 提交订单」里统一设置，本步骤无需填写。</div>
+    <div class="row" style="margin-top:12px;">
+      <button onclick="openLogin()">打开登录页（需窗口操作）</button>
+    </div>
+    <pre id="out-login" class="muted">—</pre>
+  </div>
+
+  <div class="card">
+    <h2><span class="step-badge">3</span>打开结算页并核对</h2>
+    <div class="muted">使用「④ 提交订单」里的 SKU / 数量打开结算页并读取商品信息核对（不会下单）。</div>
+    <div class="row" style="margin-top:12px;">
+      <button onclick="doCheckout()">打开并核对</button>
+      <button class="ghost" onclick="doCheckoutRetry()">重试（风控冷却后）</button>
+    </div>
+    <div id="checkout-result" class="kv" style="margin-top:12px;">—</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step-badge">4</span>提交订单（真实下单 · 线程池 / 定时）</h2>
+    <div class="muted">点击后会真实提交订单并跳转到京东收银台。<b>会产生订单（需支付）</b>。生成后请去手机/电脑收银台完成付款。</div>
+    <div class="grid2" style="margin-top:12px;">
+      <input type="text" id="sku4" placeholder="SKU（京东商品编号）" value="100342780502" title="京东商品编号，抢不同商品时改成对应编号">
+      <input type="text" id="qty4" placeholder="数量" value="1" title="购买件数，多件改大">
+      <input type="text" id="conc4" placeholder="并发数" value="1" title="同时尝试次数。>1 会生成多笔订单，仅抢购高并发时使用">
+      <input type="text" id="retry4" placeholder="重试" value="0" title="首次失败后的重试次数">
+    </div>
+    <div class="muted" style="margin-top:8px;">
+      SKU：京东商品编号 ｜ 数量：购买件数 ｜ 并发数：同一时刻点击次数（&gt;1 会生成多笔订单，一般保持 1）｜ 重试：首次失败后的重试次数（一般保持 0）
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <input type="text" id="shareLink" placeholder="粘贴京东分享短链(3.cn/…)或商品页链接，自动解析 SKU">
+      <button class="ghost" onclick="resolveLink()">解析链接</button>
+      <div class="muted" id="resolve-hint">支持 3.cn 短链 / item.jd.com 链接 / 直接填 SKU 数字</div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button class="danger" onclick="doSubmit()">立即提交</button>
+      <input type="text" id="at4" placeholder="定时时间，如 20:00 或 2026-07-22 20:00:00">
+      <button class="ghost" onclick="scheduleSubmit()">定时提交</button>
+      <button class="ghost" onclick="refreshTasks()">刷新任务</button>
+    </div>
+    <div class="note">⚠️ 并发数 &gt; 1 会在同一时刻多次点击提交，可能生成多笔订单；定时提交到点由后台线程池自动执行，页面关掉也不影响。</div>
+    <div class="muted" style="margin-top:8px;">定时任务：</div>
+    <ul class="tasks" id="tasks"><li class="muted">无</li></ul>
+    <pre id="out-submit">—</pre>
+  </div>
+
+  <div class="muted footer">原脚本 jd_direct_order.py / raw_click.py 已保留，可命令行使用。</div>
+</div>
+
+<script>
+function setBadge(id, text, on, off){
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'badge ' + (on ? 'on' : (off ? 'off' : ''));
+}
+async function refreshStatus(){
+  try{
+    const r = await fetch('/api/status', {method:'POST'});
+    const d = await r.json();
+    jd_chrome_ok = !!d.chrome_connected;
+    setBadge('b-chrome', 'Chrome：'+(d.chrome_connected?'已连接':'未连接'), d.chrome_connected, !d.chrome_connected);
+    setBadge('b-login', '登录态：'+(d.logged_in?'已登录':'未登录'), d.logged_in, !d.logged_in);
+    setBadge('b-checkout', '结算页：'+(d.has_checkout?'已打开':'未打开'), d.has_checkout, !d.has_checkout);
+    setBadge('b-pay', '收银台：'+(d.has_payment?'已打开':'未打开'), d.has_payment, !d.has_payment);
+    if(d.active_account){
+      jd_active_account = d.active_account;
+      setBadge('b-account', '当前账号：'+d.active_account, d.logged_in, !d.logged_in);
+    }
+    if(d.detail) console.log(d.detail);
+  }catch(e){ alert('状态检测失败：'+e); }
+}
+async function api(path, body){
+  // 用 text() 拿原始响应体（无论后端返回 JSON / HTML 错误页 / 被中间设备改写的内容）
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+  const raw = await r.text();
+  let d;
+  try { d = JSON.parse(raw); }
+  catch(e){
+    // 响应不是合法 JSON——很可能是中间设备（代理/扩展）改写或拦截
+    throw {__raw_response:true, status:r.status, content_type:r.headers.get('content-type')||'', body:raw.slice(0,500)};
+  }
+  // 把原始响应体附带进去（调试用，前端可以打印）
+  d.__raw = raw.slice(0,500);
+  d.__status = r.status;
+  return d;
+}
+function val(id){ return document.getElementById(id).value.trim(); }
+let jd_chrome_ok = false;  // 调试 Chrome 是否连接，供解析前预判
+let jd_headless = true;    // 当前后台无窗口模式（与界面勾选同步）
+let jd_active_account = ""; // 当前激活的京东账号名
+// SKU / 数量统一从 ④ 提交订单区读取（单一数据源，避免重复输入）
+function getSku(){ return val('sku4') || '100342780502'; }
+function getQty(){ return parseInt(val('qty4') || '1'); }
+// ---- 多账号切换 ----
+async function loadAccounts(){
+  try{
+    const d = await api('/api/accounts', {});
+    const seg = document.getElementById('account-seg');
+    seg.innerHTML = '';
+    (d.accounts||[]).forEach(a=>{
+      const b = document.createElement('button');
+      b.textContent = a.name;
+      if(a.name === d.active) b.className = 'active';
+      b.onclick = ()=> switchAccount(a.name);
+      seg.appendChild(b);
+    });
+    const hint = document.getElementById('account-hint');
+    let s = '当前账号：' + (d.active||'—');
+    const cur = (d.accounts||[]).find(a=>a.name===d.active);
+    if(cur && cur.note) s += '（'+cur.note+'）';
+    s += ' ｜ 切换为毫秒级（不重启浏览器），登录态以 states/ 文件隔离保存';
+    hint.textContent = s;
+    jd_active_account = d.active;
+  }catch(e){ console.log(e); }
+}
+async function switchAccount(name){
+  if(name === jd_active_account){ return; }
+  const hint = document.getElementById('account-hint');
+  hint.textContent = '正在切换到「'+name+'」…（重启调试 Chrome）';
+  // 先把分段控件里目标标记为 active，给出即时反馈
+  document.querySelectorAll('#account-seg button').forEach(b=>{
+    b.classList.toggle('active', b.textContent === name);
+  });
+  try{
+    const d = await api('/api/account_switch', {name: name});
+    if(d.ok){
+      hint.textContent = '已切换到「'+name+'」，正在加载该账号登录态…';
+      setTimeout(()=>{ refreshStatus(); loadAccounts(); }, 1800);
+    } else {
+      hint.textContent = '切换失败：' + (d.error||'未知错误');
+      loadAccounts();
+    }
+  }catch(e){ hint.textContent = '切换错误：'+e; loadAccounts(); }
+}
+async function addAccount(){
+  const name = prompt('新账号名称（如：小号A）：');
+  if(!name) return;
+  const note = prompt('备注（可选，可填该账号的京东昵称）：','') || '';
+  try{
+    const d = await api('/api/account_add', {name: name, note: note});
+    if(d.ok){ alert(d.message || ('已新增 '+name)); loadAccounts(); }
+    else alert('添加失败：' + (d.error||''));
+  }catch(e){ alert('错误：'+e); }
+}
+async function logoutAccount(){
+  if(!confirm('确定注销当前账号「'+(jd_active_account||'默认账号')+'」的登录态吗？\n（仅清除本地保存的登录凭据，不影响京东账号本身）')) return;
+  const hint = document.getElementById('account-hint');
+  hint.textContent = '正在注销「'+(jd_active_account||'')+'」…';
+  try{
+    const d = await api('/api/account_logout', {name: jd_active_account});
+    if(d.ok){ alert(d.message||'已注销'); refreshStatus(); loadAccounts(); }
+    else alert('注销失败：'+(d.error||''));
+  }catch(e){ alert('错误：'+e); }
+}
+async function resolveLink(){
+  let link = val('shareLink').replace(/\r?\n/g, ' ').trim();  // 仅合并换行并去首尾空白，保留中间空格（避免把商品名/编号粘到 URL 上）
+  const hint = document.getElementById('resolve-hint');
+  if(!link){ alert('请先粘贴分享链接'); return; }
+  hint.className = 'muted';
+  hint.textContent = '解析中…（纯 HTTP 跟跳转，约 1 秒内）';
+  try{
+    const d = await api('/api/resolve', {url: link});
+    if(!d.ok){
+      let msg = '❌ 解析失败：'+(d.error||'未知错误');
+      const dbg = [];
+      if(d.from) dbg.push('来源: '+d.from);
+      if(d.trace) dbg.push('堆栈: '+d.trace);
+      if(d.final_url) dbg.push('最终URL: '+d.final_url);
+      if(d.api_func) dbg.push('接口: '+d.api_func);
+      // 关键诊断：如果原始响应体里没有 error 字符串，说明被中间设备改写过
+      if(d.__raw && (!d.error || d.__raw.indexOf(d.error)===-1)){
+        dbg.push('⚠️ 原始响应与 error 字段不一致（可能被代理/扩展改写）:');
+        dbg.push(d.__raw);
+      }
+      if(d.__status) dbg.push('HTTP 状态: '+d.__status);
+      if(dbg.length) msg += '\n—— 调试信息 ——\n'+dbg.join('\n');
+      hint.className = 'muted err';
+      hint.textContent = msg;
+      return;
+    }
+    document.getElementById('sku4').value = d.sku;
+    let ok = '✅ 已解析 SKU：'+d.sku+'（已填入上方）';
+    if(d.from) ok += '\n来源: '+d.from;
+    if(d.final_url) ok += '\n商品页: '+d.final_url;
+    hint.className = 'muted ok';
+    hint.textContent = ok;
+  }catch(e){
+    hint.className = 'muted err';
+    if(e && e.__raw_response){
+      hint.textContent = '❌ 响应不是合法 JSON（可能被代理/扩展拦截改写）\nHTTP 状态: '+e.status+'\nContent-Type: '+e.content_type+'\n原始响应体:\n'+e.body;
+    } else {
+      hint.textContent = '❌ 解析请求异常：'+e+'\n（请检查 GUI 服务是否在运行）';
+    }
+  }
+}
+async function launchChrome(){
+  const o = document.getElementById('out-launch');
+  o.className=''; o.textContent='启动中…';
+  const headless = document.getElementById('headlessChk').checked;
+  try{
+    const d = await api('/api/launch_chrome', {headless: headless});
+    o.textContent = JSON.stringify(d, null, 2);
+    if(d.ok){ jd_headless = headless; setTimeout(refreshStatus, 1500); }
+  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+}
+async function openLogin(){
+  const o = document.getElementById('out-login');
+  o.className=''; o.textContent='打开中…';
+  try{
+    const d = await api('/api/open_login', {sku:getSku(), qty:getQty()});
+    o.textContent = JSON.stringify(d, null, 2);
+    refreshStatus();
+  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+}
+async function doCheckout(){
+  const box = document.getElementById('checkout-result');
+  box.innerHTML = '打开中…';
+  try{
+    const d = await api('/api/checkout', {sku:getSku(), qty:getQty()});
+    renderCheckout(box, d);
+    refreshStatus();
+  }catch(e){ box.innerHTML = '<span class="err">错误：'+e+'</span>'; }
+}
+async function doCheckoutRetry(){
+  const box = document.getElementById('checkout-result');
+  box.innerHTML = '重试中（已等风控冷却 2s）…';
+  try{
+    const d = await api('/api/checkout_retry', {sku:getSku(), qty:getQty()});
+    renderCheckout(box, d);
+    refreshStatus();
+  }catch(e){ box.innerHTML = '<span class="err">错误：'+e+'</span>'; }
+}
+function renderCheckout(box, d){
+  if(!d.ok){ box.innerHTML = '<span class="err">失败：'+(d.error||'')+'</span>'; return; }
+  if(d.risk_control){
+    let h = '<div class="note" style="color:var(--red);background:#fdeaea;border-color:#f5c6c6;">'
+          + '⚠️ <b>账号被京东风控拦截</b>：页面显示「活动异常火爆，已优先接入快速通道」。<br>'
+          + '这不是程序问题，是京东对频繁访问的临时限制。请：<br>'
+          + '1）暂停点击，等待 1~5 分钟让风控解除；<br>'
+          + '2）解除后点「重试（风控冷却后）」或「打开并核对」再读；<br>'
+          + '3）不要短时间内反复打开结算页，会加重风控。<br>'
+          + '（可在手机京东 App 正常操作下单）</div>';
+    box.innerHTML = h;
+    return;
+  }
+  let h = '';
+  h += '商品：<b>'+(d.product_name||'(未解析到名称)')+'</b><br>';
+  h += 'SKU：'+d.sku+' ｜ 数量(输入/页内)：'+d.qty_input+' / '+(d.qty_found??'—')+'<br>';
+  h += '价格：<b>'+(d.price?('¥'+d.price):'(未解析)')+'</b><br>';
+  if(d.address_hint) h += '地址：'+d.address_hint+'<br>';
+  if(d.phone) h += '手机号：<b>'+d.phone+'</b><br>';
+  h += '<details style="margin-top:8px;"><summary class="muted">查看结算页原文</summary><pre>'+((d.text_snippet||'').replace(/</g,'&lt;'))+'</pre></details>';
+  box.innerHTML = h;
+}
+async function doSubmit(){
+  const o = document.getElementById('out-submit');
+  o.className=''; o.textContent='线程池提交中…';
+  try{
+    const d = await api('/api/submit', {
+      sku: val('sku4')||'100342780502',
+      qty: parseInt(val('qty4')||'1'),
+      concurrency: parseInt(val('conc4')||'1'),
+      retries: parseInt(val('retry4')||'0')
+    });
+    o.textContent = JSON.stringify(d, null, 2);
+    refreshStatus(); refreshTasks();
+  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+}
+async function scheduleSubmit(){
+  const at = val('at4');
+  if(!at){ alert('请先填写定时时间，如 20:00 或 2026-07-22 20:00:00'); return; }
+  const o = document.getElementById('out-submit');
+  o.className=''; o.textContent='安排中…';
+  try{
+    const d = await api('/api/submit_schedule', {
+      sku: val('sku4')||'100342780502',
+      qty: parseInt(val('qty4')||'1'),
+      concurrency: parseInt(val('conc4')||'1'),
+      retries: parseInt(val('retry4')||'0'),
+      at: at
+    });
+    o.textContent = JSON.stringify(d, null, 2);
+    refreshTasks();
+  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+}
+function renderTasks(d){
+  const el = document.getElementById('tasks');
+  if(!d.ok || !d.tasks || !d.tasks.length){ el.innerHTML='<li class="muted">无</li>'; return; }
+  let h='';
+  for(const t of d.tasks){
+    const st=t.status;
+    const color = st==='done'?'var(--green)':(st==='error'?'var(--red)':(st==='cancelled'?'#999':'var(--red)'));
+    h += '<li>#'+t.id+' @ '+t.at_str+' ['+t.sku+' ×'+t.qty+'] <b style="color:'+color+'">'+st+'</b>';
+    if(t.status==='pending' || t.status==='running'){
+      h += ' <a href="#" onclick="cancelSubmit(\''+t.id+'\');return false;" style="color:var(--red)">取消</a>';
+    }
+    if(t.result && t.result.order_id){ h += ' 单号:'+t.result.order_id; }
+    h += '</li>';
+  }
+  el.innerHTML = h;
+}
+async function refreshTasks(){
+  try{ const d = await api('/api/submit_tasks', {}); renderTasks(d); }
+  catch(e){ console.log(e); }
+}
+async function cancelSubmit(id){
+  if(!id) return;
+  if(!confirm('取消定时任务 '+id+'？')) return;
+  try{
+    const d = await api('/api/submit_cancel', {task_id:id});
+    alert(d.ok ? '已取消' : ('失败: '+(d.error||'')));
+    refreshTasks();
+  }catch(e){ alert('错误：'+e); }
+}
+refreshStatus();
+refreshTasks();
+loadAccounts();
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, obj=None, html=None):
+        self.send_response(code)
+        # 强制不缓存：避免改完代码后浏览器还在跑旧 JS
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        if html is not None:
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            body = html.encode("utf-8")
+        else:
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path  # 去掉 query string，避免 `/?nocache=...` 走到 404
+        if path in ("", "/", "/index.html"):
+            self._send(200, html=HTML)
+        else:
+            self._send(404, {"error": "not found", "path": path})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            data = {}
+
+        def run(func, *a, timeout=35):
+            # 在子线程里跑阻塞的 CDP 操作，避免卡主 server
+            res = {}
+
+            def worker():
+                try:
+                    res["v"] = func(*a)
+                except Exception as e:
+                    import traceback
+                    res["v"] = {"ok": False, "error": str(e),
+                                "trace": traceback.format_exc()[-500:]}
+
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            t.join(timeout=timeout)
+            return res.get("v", {"ok": False, "error": "操作超时"})
+
+        try:
+            if self.path == "/api/status":
+                v = run(jd.chrome_status)
+            elif self.path == "/api/launch_chrome":
+                hl = bool(data.get("headless", True))
+                if CURRENT_HEADLESS["val"] != hl:
+                    # 模式变了 → 重启切换（登录态保留在 states/ 文件）
+                    v = run(jd.restart_debug_chrome, hl)
+                else:
+                    v = run(jd.launch_debug_chrome, hl)
+                CURRENT_HEADLESS["val"] = hl
+            elif self.path == "/api/open_login":
+                # 登录需肉眼操作验证码 → 若当前无窗口，先切到窗口模式
+                if CURRENT_HEADLESS["val"]:
+                    jd.restart_debug_chrome(False)
+                    CURRENT_HEADLESS["val"] = False
+                v = run(jd.open_login_page, data.get("sku", "100342780502"),
+                        int(data.get("qty", 1)))
+            elif self.path == "/api/checkout":
+                v = run(jd.checkout, data.get("sku", "100342780502"),
+                        int(data.get("qty", 1)))
+            elif self.path == "/api/checkout_retry":
+                # 风控/异常后重试：重开结算页（建议先等风控冷却，勿频繁点）
+                v = run(jd.retry_checkout, data.get("sku", "100342780502"),
+                        int(data.get("qty", 1)), timeout=40)
+            elif self.path == "/api/resolve":
+                v = run(jd.resolve_share_link, data.get("url", ""))
+            elif self.path == "/api/submit":
+                # 线程池提交，可能含并发/重试，给更长超时
+                v = run(_fire,
+                        data.get("sku", "100342780502"),
+                        int(data.get("qty", 1)),
+                        int(data.get("concurrency", 1)),
+                        int(data.get("retries", 0)),
+                        timeout=80)
+            elif self.path == "/api/submit_schedule":
+                try:
+                    v = schedule_submit(data)
+                except Exception as e:
+                    v = {"ok": False, "error": str(e)}
+            elif self.path == "/api/submit_tasks":
+                v = list_tasks()
+            elif self.path == "/api/submit_cancel":
+                v = cancel_task(data.get("task_id"))
+            elif self.path == "/api/accounts":
+                v = run(jd.list_accounts)
+            elif self.path == "/api/account_switch":
+                v = run(jd.switch_account, data.get("name", ""),
+                        CURRENT_HEADLESS["val"])
+            elif self.path == "/api/account_add":
+                v = run(jd.add_account, data.get("name", ""), data.get("note", ""))
+            elif self.path == "/api/account_logout":
+                v = run(jd.logout_account, data.get("name", ""))
+            else:
+                self._send(404, {"error": "no route"})
+                return
+            log.info("POST %s | %s", self.path, _summ(v))
+            self._send(200, v)
+        except Exception as e:
+            log.exception("POST %s 异常", self.path)
+            self._send(500, {"ok": False, "error": str(e)})
+
+    def log_message(self, fmt, *args):
+        try:
+            msg = fmt % args if args else fmt
+        except Exception:
+            msg = " ".join(map(str, (fmt,) + args))
+        log.info("HTTP %s", msg)
+
+
+if __name__ == "__main__":
+    print(f"京东抢购 GUI 已启动： http://127.0.0.1:{PORT}")
+    print("依赖调试 Chrome 运行在 127.0.0.1:9222。Ctrl+C 停止。")
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.serve_forever()
