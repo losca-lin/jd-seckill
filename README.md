@@ -30,6 +30,8 @@ jd-seckill/
 ├── states/              # 各账号登录态（自动生成，已 gitignore，含隐私）
 ├── requirements.txt
 ├── README.md
+├── docs/
+│   └── jd-operation-manual.md   # 详细操作手册（由 doc/ 搬迁而来）
 └── .gitignore
 ```
 
@@ -61,6 +63,8 @@ python jd_gui_server.py
 3. 在「提交订单」区填 SKU / 数量，或粘贴分享链接点「解析链接」
 4. 点「打开并核对」确认商品 / 价格 / 地址 / **手机号**
 5. 点「立即提交」真实下单，跳转京东收银台后去付款
+
+> 更详细的逐页操作截图与说明见 [docs/jd-operation-manual.md](docs/jd-operation-manual.md)（原 `doc/` 下文档，已随项目迁移）。
 
 ## 多账号
 
