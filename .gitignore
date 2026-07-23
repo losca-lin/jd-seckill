@@ -1,0 +1,15 @@
+# 京东登录态（cookie/localStorage），隐私，禁止提交
+states/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行日志
+*.log
+
+# 临时文件
+*.tmp
+
+# 截图等二进制
+*.png
