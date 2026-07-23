@@ -1,1 +1,1 @@
-playwright>=1.40
+websocket-client>=1.0

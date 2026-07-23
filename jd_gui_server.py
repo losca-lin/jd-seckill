@@ -776,6 +776,8 @@ class Handler(BaseHTTPRequestHandler):
                 v = run(jd.add_account, data.get("name", ""), data.get("note", ""))
             elif self.path == "/api/account_logout":
                 v = run(jd.logout_account, data.get("name", ""))
+            elif self.path == "/api/debug_cookies":
+                v = run(jd.debug_cookies)
             else:
                 self._send(404, {"error": "no route"})
                 return
