@@ -457,7 +457,7 @@ function updateStatusActions(d){
     launch.style.display=''; login.style.display='none';
   }
 }
-// 切换「后台无窗口」即重启调试 Chrome 切换窗口模式（登录态保留在 states/）
+// 切换「后台无窗口」即重启调试 Chrome 切换窗口模式（登录态保留在 Chrome profile / user-data-dir，无需 states/）
 function onHeadlessChange(){ launchChrome(); }
 
 async function api(path, body){
@@ -499,7 +499,7 @@ async function loadAccounts(){
     let s = '当前账号：' + (d.active||'—');
     const cur = (d.accounts||[]).find(a=>a.name===d.active);
     if(cur && cur.note) s += '（'+cur.note+'）';
-    s += ' ｜ 切换为毫秒级（不重启浏览器），登录态以 states/ 文件隔离保存';
+    s += ' ｜ 切换为毫秒级（不重启浏览器），登录态由 Chrome profile（user-data-dir）按账号隔离保存';
     hint.textContent = s;
     jd_active_account = d.active;
   }catch(e){ console.log(e); }
@@ -646,9 +646,19 @@ function renderCheckout(box, d){
 async function doSubmit(){
   const o = document.getElementById('out-submit');
   const btn = document.getElementById('btn-buy');
+  const box = document.getElementById('checkout-result');
   if(btn) btn.disabled = true;
-  if(o){ o.className=''; o.textContent='抢购中（自动打开结算页并提交）…'; }
+  if(o){ o.className=''; o.textContent='读取商品信息（打开结算页）中…'; }
   try{
+    // 1) 先解析结算页：让用户看清「买的是什么」，同时检测京东风控
+    const c = await api('/api/checkout', {sku:getSku(), qty:getQty()});
+    if(box) renderCheckout(box, c);
+    if(c.risk_control){
+      if(o) o.textContent = '⚠️ 账号被京东风控拦截，已停止提交（见上方说明）。请等待风控解除后再试，切勿连续点击。';
+      return; // 不提交，避免加重风控
+    }
+    // 2) 商品信息正常 → 真实提交（复用刚打开的结算页，无需再开一次）
+    if(o) o.textContent='抢购中（自动提交订单）…';
     const d = await api('/api/submit', {
       sku: getSku(),
       qty: getQty(),
@@ -658,7 +668,12 @@ async function doSubmit(){
     if(o) o.textContent = JSON.stringify(d, null, 2);
     refreshStatus(); refreshTasks();
   }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
-  finally{ if(btn) btn.disabled = false; }
+  finally{
+    if(btn){
+      // 3 秒冷却：避免短时间连点反复打开结算页，触发京东风控
+      setTimeout(()=>{ btn.disabled=false; }, 3000);
+    }
+  }
 }
 async function scheduleSubmit(){
   const at = val('at4');
@@ -761,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/launch_chrome":
                 hl = bool(data.get("headless", True))
                 if CURRENT_HEADLESS["val"] != hl:
-                    # 模式变了 → 重启切换（登录态保留在 states/ 文件）
+                    # 模式变了 → 重启切换（登录态保留在 Chrome profile / user-data-dir，无需 states/）
                     v = run(jd.restart_debug_chrome, hl)
                 else:
                     v = run(jd.launch_debug_chrome, hl)

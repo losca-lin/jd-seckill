@@ -1,5 +1,5 @@
-# 京东登录态（cookie/localStorage），隐私，禁止提交
-states/
+# 账号配置（本地账号名 / profile 映射，按需求不纳入版本库）
+jd_accounts.json
 
 # 浏览器 profile 目录（真实 Chrome 用户数据，体积大且含隐私，禁止提交）
 chrome_jd/
