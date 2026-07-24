@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import javax.annotation.Resource;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -104,35 +105,46 @@ public class ApiController {
         int qty = toInt(data.get("qty"), 1);
         int conc = Math.max(1, toInt(data.get("concurrency"), 1));
         int retries = Math.max(0, toInt(data.get("retries"), 0));
+        Map<String, Object> res;
         if (conc <= 1) {
             // 单次+重试：优先复用已有结算页（最快），失败再 ensure_checkout
-            return chrome.run(() -> {
+            res = chrome.run(() -> {
                 Map<String, Object> r = submitService.submitOrder(sku, qty, false, null);
                 if (!Boolean.parseBoolean(String.valueOf(r.getOrDefault("ok", false)))) {
                     r = submitService.submitOrder(sku, qty, true, null);
                 }
                 return r;
             }, 80);
-        }
-        return chrome.run(() -> {
-            Map<String, Object> chk = checkoutService.checkout(sku, qty, false);
-            if (!(Boolean) chk.getOrDefault("ok", false)) {
-                return map("ok", false, "error", "打开结算页失败: " + chk.get("error"));
-            }
-            for (int i = 0; i < conc; i++) {
-                if (i > 0) {
-                    try {
-                        Thread.sleep(150 * i);
-                    } catch (InterruptedException ignored) {
+        } else {
+            res = chrome.run(() -> {
+                Map<String, Object> chk = checkoutService.checkout(sku, qty, false);
+                if (!(Boolean) chk.getOrDefault("ok", false)) {
+                    return map("ok", false, "error", "打开结算页失败: " + chk.get("error"));
+                }
+                for (int i = 0; i < conc; i++) {
+                    if (i > 0) {
+                        try {
+                            Thread.sleep(150 * i);
+                        } catch (InterruptedException ignored) {
+                        }
+                    }
+                    Map<String, Object> r = submitService.submitOrder(sku, qty, false, null);
+                    if (Boolean.parseBoolean(String.valueOf(r.getOrDefault("ok", false)))) {
+                        return r;
                     }
                 }
-                Map<String, Object> r = submitService.submitOrder(sku, qty, false, null);
-                if (Boolean.parseBoolean(String.valueOf(r.getOrDefault("ok", false)))) {
-                    return r;
-                }
-            }
-            return map("ok", false, "error", "并发提交均未成功");
-        }, 80);
+                return map("ok", false, "error", "并发提交均未成功");
+            }, 80);
+        }
+        // 抢到即推微信（立即抢购也会触发，与定时任务一致）
+        if (Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false)))) {
+            Map<String, Object> task = new LinkedHashMap<>();
+            task.put("sku", sku);
+            task.put("qty", qty);
+            task.put("at_str", "立即抢购");
+            notifyService.notifySuccess(task, res);
+        }
+        return res;
     }
 
     @PostMapping("/api/submit_schedule")

@@ -1130,6 +1130,11 @@ class Handler(BaseHTTPRequestHandler):
                         int(data.get("concurrency", 1)),
                         int(data.get("retries", 0)),
                         timeout=80)
+                # 立即抢购成功也推微信（与定时任务一致）
+                if v.get("ok"):
+                    _notify_success({"sku": data.get("sku", "100342780502"),
+                                     "qty": data.get("qty", 1),
+                                     "at_str": "立即抢购"}, v)
             elif self.path == "/api/submit_schedule":
                 try:
                     v = schedule_submit(data)
