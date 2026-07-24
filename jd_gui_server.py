@@ -296,8 +296,13 @@ HTML = r"""<!DOCTYPE html>
   .step-badge{ display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 7px;
         border-radius:50%; background:var(--blue); color:#fff; font-size:12px; font-weight:600; margin-right:10px; }
   .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-  .grid2{ display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .grid2{ display:grid; grid-template-columns:repeat(2,1fr); gap:16px; }
   @media(max-width:520px){ .grid2{ grid-template-columns:1fr; } }
+  .field{ display:flex; flex-direction:column; gap:6px; }
+  .field label{ font-size:13px; font-weight:500; color:var(--ink-2); }
+  .field label .tag{ font-size:11px; font-weight:400; padding:2px 6px; border-radius:4px; margin-left:4px; display:inline-block; }
+  .field label .tag.required{ background:var(--red); color:#fff; }
+  .field label .tag.hint{ background:#e5e5ea; color:var(--ink-2); }
   input[type=text]{ padding:11px 14px; border:1px solid var(--line); border-radius:12px; font-size:15px; flex:1; min-width:120px;
         background:#fbfbfd; outline:none; transition:border-color .2s, box-shadow .2s, background .2s; }
   input[type=text]:focus{ border-color:var(--blue); box-shadow:0 0 0 4px rgba(0,113,227,.12); background:#fff; }
@@ -387,11 +392,23 @@ HTML = r"""<!DOCTYPE html>
       <button class="ghost" onclick="resolveLink()">解析链接</button>
     </div>
     <div class="muted" id="resolve-hint" style="margin-top:6px;">支持 3.cn 短链 / item.jd.com 链接 / 直接填 SKU 数字</div>
-    <div class="grid2" style="margin-top:12px;">
-      <input type="text" id="sku4" placeholder="SKU（京东商品编号）" value="100342780502">
-      <input type="text" id="qty4" placeholder="数量" value="1">
-      <input type="text" id="conc4" placeholder="并发数（一般 1）" value="1">
-      <input type="text" id="retry4" placeholder="重试次数（一般 0）" value="0">
+    <div class="grid2" style="margin-top:16px;">
+      <div class="field">
+        <label for="sku4">商品 SKU <span class="tag required">必填</span></label>
+        <input type="text" id="sku4" value="100342780502" title="京东商品编号，填数字">
+      </div>
+      <div class="field">
+        <label for="qty4">购买数量</label>
+        <input type="text" id="qty4" value="1" title="购买件数">
+      </div>
+      <div class="field">
+        <label for="conc4">并发数 <span class="tag hint">建议保持 1</span></label>
+        <input type="text" id="conc4" value="1" title="同一时刻连续点击次数。>1 会生成多笔订单且极易触发京东风控，一般保持 1">
+      </div>
+      <div class="field">
+        <label for="retry4">失败重试次数 <span class="tag hint">一般 0</span></label>
+        <input type="text" id="retry4" value="0" title="首次提交失败后重试几次。>0 可能延长总耗时，一般保持 0">
+      </div>
     </div>
     <div class="row" style="margin-top:14px;">
       <button class="danger buy-btn" id="btn-buy" onclick="doSubmit()">🚀 立即抢购</button>
