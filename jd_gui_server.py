@@ -427,6 +427,7 @@ async function refreshStatus(){
     const r = await fetch('/api/status', {method:'POST'});
     const d = await r.json();
     jd_chrome_ok = !!d.chrome_connected;
+    jd_logged_in = !!d.logged_in;
     setBadge('b-chrome', 'Chrome：'+(d.chrome_connected?'已连接':'未连接'), d.chrome_connected, !d.chrome_connected);
     setBadge('b-login', '登录态：'+(d.logged_in?'已登录':'未登录'), d.logged_in, !d.logged_in);
     setBadge('b-checkout', '结算页：'+(d.has_checkout?'已打开':'未打开'), d.has_checkout, !d.has_checkout);
@@ -476,9 +477,29 @@ async function api(path, body){
   return d;
 }
 function val(id){ return document.getElementById(id).value.trim(); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+// 下单前守卫：未登录则自动打开登录页并轮询等待完成，避免跳过登录直接 checkout 失败
+async function ensureLoggedIn(o){
+  let st;
+  try { st = await api('/api/status'); } catch(e){ st = {logged_in:false}; }
+  if(st.logged_in){ jd_logged_in = true; return true; }
+  if(o) o.textContent = '未登录：正在打开登录页，请在弹出的浏览器窗口完成扫码 / 短信登录…';
+  try { await api('/api/open_login', {sku:getSku(), qty:getQty()}); }
+  catch(e){ if(o){ o.className='err'; o.textContent='打开登录页失败：'+e; } return false; }
+  if(o) o.textContent = '登录页已打开，等待你完成登录（最多 120 秒）…';
+  for(let i=0;i<60;i++){
+    await sleep(2000);
+    try { st = await api('/api/status'); } catch(e){ continue; }
+    if(st.logged_in){ jd_logged_in = true; if(o) o.textContent='✅ 登录成功，继续抢购…'; refreshStatus(); return true; }
+  }
+  jd_logged_in = false;
+  if(o){ o.className='err'; o.textContent='⏱️ 登录等待超时（120 秒）。请确认已在浏览器窗口完成登录后重试；也可直接点状态栏「去登录」。'; }
+  return false;
+}
 let jd_chrome_ok = false;  // 调试 Chrome 是否连接，供解析前预判
 let jd_headless = true;    // 当前后台无窗口模式（与界面勾选同步）
 let jd_active_account = ""; // 当前激活的京东账号名
+let jd_logged_in = false;  // 当前账号是否已登录京东（供下单前守卫判断）
 // SKU / 数量统一从 ④ 提交订单区读取（单一数据源，避免重复输入）
 function getSku(){ return val('sku4') || '100342780502'; }
 function getQty(){ return parseInt(val('qty4') || '1'); }
@@ -607,6 +628,7 @@ async function doCheckout(){
   const box = document.getElementById('checkout-result');
   box.innerHTML = '打开中…';
   try{
+    if(!await ensureLoggedIn(box)) return;  // 未登录先登录，再读结算页
     const d = await api('/api/checkout', {sku:getSku(), qty:getQty()});
     renderCheckout(box, d);
     refreshStatus();
@@ -648,8 +670,10 @@ async function doSubmit(){
   const btn = document.getElementById('btn-buy');
   const box = document.getElementById('checkout-result');
   if(btn) btn.disabled = true;
-  if(o){ o.className=''; o.textContent='读取商品信息（打开结算页）中…'; }
+  if(o){ o.className=''; o.textContent='准备抢购（先确认登录态）…'; }
   try{
+    // 0) 登录守卫：未登录先打开登录页并等待完成，再继续
+    if(!await ensureLoggedIn(o)) return;
     // 1) 先解析结算页：让用户看清「买的是什么」，同时检测京东风控
     const c = await api('/api/checkout', {sku:getSku(), qty:getQty()});
     if(box) renderCheckout(box, c);
