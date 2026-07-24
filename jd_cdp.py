@@ -111,6 +111,7 @@ def switch_account(name, headless=True):
         time.sleep(0.3)
         if not _is_port_open():
             break
+    invalidate_login_cache()  # 切换账号后登录态需重新探测
     return launch_debug_chrome(headless=headless, profile_dir=active_profile_dir())
 
 
@@ -144,6 +145,7 @@ def logout_account(name=None):
                 removed.append(fn)
             except Exception as e:
                 return {"ok": False, "error": f"删除登录态失败（{fn}）: {e}"}
+    invalidate_login_cache()  # 注销后登录态必为 False，立即失效缓存
     return {"ok": True, "account": acc["name"], "removed": removed,
             "message": f"已清除「{acc['name']}」的京东登录态，请重新登录"}
 
@@ -395,29 +397,57 @@ def launch_debug_chrome(headless=True, profile_dir=None):
 # ----------------------------------------------------------------------------
 # 高层流程
 # ----------------------------------------------------------------------------
-def chrome_status():
+# 登录态探测代价较高（每次都要开 m.jd.com 标签 + 等加载），故加短缓存：
+# 常规 /api/status 轮询（前端每 3 秒一次）直接返回缓存，避免一直占用单线程浏览器 worker；
+# 仅在 force=True（登录中轮询等待）或缓存过期（默认 15 秒）时才真正去探测。
+_LOGIN_CACHE = {"val": None, "ts": 0.0}
+_LOGIN_CACHE_TTL = 15.0
+
+
+def invalidate_login_cache():
+    """登录态可能已变化时调用：清掉缓存，下次状态查询强制重新探测。"""
+    _LOGIN_CACHE["val"] = None
+    _LOGIN_CACHE["ts"] = 0.0
+
+
+def _probe_logged_in():
+    """开 m.jd.com 探针页，等加载后读 cookie 判断是否有 pt_key。"""
+    tid = create_target("https://m.jd.com")
+    ws = page_ws_by_target(tid)
+    pg = CDPPage(ws)
+    time.sleep(1.5)
+    cookies = pg.get_cookies()
+    names = [c.get("name") for c in cookies]
+    pg.close()
+    close_target(tid)
+    return "pt_key" in names
+
+
+def chrome_status(force=False):
     """返回调试 Chrome 连接状态 + 登录态 + 是否有结算页/收银台。"""
     out = {"chrome_connected": False, "logged_in": False, "has_checkout": False,
            "has_payment": False, "detail": "", "active_account": get_active_account()["name"]}
     try:
-        list_pages()  # 探活
+        list_pages()  # 探活（一个 HTTP 到 9222，毫秒级）
         out["chrome_connected"] = True
     except Exception as e:
         out["detail"] = f"无法连接 9222: {e}"
+        _LOGIN_CACHE["val"] = False
+        _LOGIN_CACHE["ts"] = time.time()
         return out
-    # 登录态：临时开 m.jd.com 看 cookie 里有无 pt_key
-    try:
-        tid = create_target("https://m.jd.com")
-        ws = page_ws_by_target(tid)
-        pg = CDPPage(ws)
-        time.sleep(1.5)
-        cookies = pg.get_cookies()
-        names = [c.get("name") for c in cookies]
-        out["logged_in"] = "pt_key" in names
-        pg.close()
-        close_target(tid)
-    except Exception as e:
-        out["detail"] = f"登录态检测失败: {e}"
+    # 登录态：优先用缓存，避免每次轮询都开标签 + 等 1.5 秒
+    need_probe = force or _LOGIN_CACHE["val"] is None \
+        or (time.time() - _LOGIN_CACHE["ts"]) > _LOGIN_CACHE_TTL
+    if need_probe:
+        try:
+            out["logged_in"] = _probe_logged_in()
+            _LOGIN_CACHE["val"] = out["logged_in"]
+            _LOGIN_CACHE["ts"] = time.time()
+        except Exception as e:
+            out["detail"] = f"登录态检测失败: {e}"
+            # 探测失败时不刷新缓存（保留上次有效值），避免误判
+    else:
+        out["logged_in"] = _LOGIN_CACHE["val"]
     try:
         out["has_checkout"] = find_page("trade.m.jd.com/pay") is not None
         out["has_payment"] = find_page("mpay.m.jd.com") is not None
@@ -648,10 +678,11 @@ def open_login_page(sku=DEFAULT_SKU, qty=1):
     time.sleep(1.0)
     url = pg.eval_js("location.href")
     pg.close()
+    invalidate_login_cache()  # 打开登录页后，下次状态查询应重新探测是否登录成功
     return {"ok": True, "target_id": tid, "url": url}
 
 
-def checkout(sku=DEFAULT_SKU, qty=1):
+def checkout(sku=DEFAULT_SKU, qty=1, keep_open=False):
     """打开/刷新结算页并解析商品信息。
 
     关键坑（已验证）：旧的结算页 tab 可能因之前下单/导航而进入异常态，
@@ -730,17 +761,22 @@ def checkout(sku=DEFAULT_SKU, qty=1):
     txt = ""
     title = ""
     ready = False
-    for i in range(25):  # 最多约 25s
-        time.sleep(1.0)
-        title = pg.eval_js("document.title") or ""
-        html = pg.eval_js("document.documentElement && document.documentElement.outerHTML") or ""
-        txt = pg.eval_js("document.body && document.body.innerText") or ""
+    deadline = time.time() + 25  # 最长约 25s
+    time.sleep(0.4)  # 首次给页面一点初始加载时间，然后快速轮询
+    while time.time() < deadline:
+        # 先查后台拦截的接口数据（本地变量，无网络开销）：到了立即返回，无需再等 DOM
         with api_body["lock"]:
             got_api = api_body.get("data")
         if got_api:
-            # 已拦截到接口数据，无需再等 DOM
             ready = True
             break
+        try:
+            title = pg.eval_js("document.title") or ""
+            html = pg.eval_js("document.documentElement && document.documentElement.outerHTML") or ""
+            txt = pg.eval_js("document.body && document.body.innerText") or ""
+        except Exception:
+            time.sleep(0.25)
+            continue
         if _is_risk_control(html, txt):
             break  # 风控页无需再等
         # 实质内容判定：HTML 里有价格符号且商品名类文本
@@ -749,8 +785,9 @@ def checkout(sku=DEFAULT_SKU, qty=1):
             if ("京东自营" in html or "合计" in html) and ("¥" in hsp or "￥" in hsp):
                 ready = True
                 break
+        time.sleep(0.25)
     stop["v"] = True
-    time.sleep(0.3)
+    time.sleep(0.15)
     # 优先用接口 JSON 解析，失败回退 DOM 解析
     info = None
     with api_body["lock"]:
@@ -788,6 +825,10 @@ def checkout(sku=DEFAULT_SKU, qty=1):
             listen_pg.close()
     except Exception:
         pass
+    if keep_open:
+        # 预热模式：保留结算页标签页不关闭，返回 target_id 供到点直接提交，压低开抢瞬间延迟
+        return {"ok": True, "target_id": tid, "url": pay_url,
+                "ready": ready, "risk_control": _is_risk_control(html, txt)}
     pg.close()
     return info
 
@@ -944,7 +985,7 @@ CHECKOUT_API_IDS = ("balance_getCurrentOrder_m", "balance_getCart_m",
                     "getCart", "balance_getCurrentOrder", "balance_getCart")
 
 
-def submit_order(sku=DEFAULT_SKU, qty=1, ensure_checkout=True):
+def submit_order(sku=DEFAULT_SKU, qty=1, ensure_checkout=True, target_id=None):
     """点击结算页底部 ActionBar_submit 提交按钮，轮询跳转到收银台。返回 orderId 等信息。
 
     ensure_checkout=True 时先打开/刷新结算页（保证 trade 页存在），适合定时/并发场景；
@@ -955,33 +996,50 @@ def submit_order(sku=DEFAULT_SKU, qty=1, ensure_checkout=True):
             checkout(sku, qty)
         except Exception as e:
             return {"ok": False, "error": f"打开结算页失败: {e}"}
-    page = find_page("trade.m.jd.com/pay")
+    if target_id:
+        page = next((p for p in list_pages() if p.get("id") == target_id), None)
+    else:
+        page = find_page("trade.m.jd.com/pay")
     if not page:
         return {"ok": False, "error": "未找到结算页，请先执行 checkout"}
     pg = CDPPage(page["webSocketDebuggerUrl"])
+    if target_id:
+        # 预热页在开抢前已打开，提交前刷新到 20:00 最新态（确保库存/提交按钮为放货后状态）
+        try:
+            pg.send("Page.reload")
+            time.sleep(1.5)
+        except Exception:
+            pass
+    # 记录点击前已存在的收银台页面 URL：避免把「历史残留的收银台」误判为本单成功。
+    # 京东下单成功后才会打开 mpay 收银台；若浏览器里本来就有 mpay 页面（之前下单/手机同步/手动开过），
+    # 全局 find_page 会立即命中它，导致「没真下单却报告成功、且订单号是别人的旧单」。
+    # 因此本次只认「点击提交后新出现的」mpay 页面（URL 不在 baseline 中）。
+    trade_tid = page["id"]
+    baseline_mpay = {p.get("url") for p in list_pages()
+                     if "mpay.m.jd.com" in (p.get("url") or "")}
     # 取提交按钮坐标
     btn = pg.eval_js("""(() => {
-        const all=[...document.querySelectorAll('*')];
-        // 策略1：TARO-BUTTON-CORE 且 class 含 ActionBar_submit（最精准，不依赖按钮自身文字，
-        //   因新版京东 DOM 把「在线支付」文字放进 TARO-TEXT-CORE 子元素，按钮 innerText 为空）
-        let e=all.find(el=>{
-            const c=(el.className||'').toString();
-            return el.tagName==='TARO-BUTTON-CORE' && c.includes('ActionBar_submit');
-        });
-        // 策略2：class 含 ActionBar_submit 的任意元素（兼容非 button 标签包裹的情况）
-        if(!e) e=all.find(el=>{const c=(el.className||'').toString(); return c.includes('ActionBar_submit');});
-        // 策略3：底部 ActionBar_buttons 容器内文字含「在线支付」
-        if(!e) e=all.find(el=>{
-            const c=(el.className||'').toString();
-            const t=(el.textContent||'').trim();
-            return c.includes('ActionBar_buttons') && t.includes('在线支付');
-        });
-        // 策略4：全页找到可见的、文字含「在线支付」的可点击元素
-        if(!e) e=all.find(el=>{
-            const t=(el.tagName||'');
-            const txt=(el.textContent||'').trim();
-            return (t==='TARO-BUTTON-CORE'||t==='BUTTON'||t==='A') && txt.includes('在线支付') && el.offsetParent!==null;
-        });
+        // 快路径：原生 CSS 选择器一步定位，避免 [...querySelectorAll('*')] 全页遍历。
+        // 注意不能用按钮文字「在线支付」定位：新版京东把文字放进 TARO-TEXT-CORE 子元素，按钮 innerText 为空，
+        // 故以 class 含 ActionBar_submit 为准（与原策略1/2 等价）。
+        let e=document.querySelector('taro-button-core[class*="ActionBar_submit"]')
+            || document.querySelector('[class*="ActionBar_submit"]');
+        if(!e){
+            // 慢路径兜底：全页遍历
+            const all=[...document.querySelectorAll('*')];
+            // 底部 ActionBar_buttons 容器内文字含「在线支付」
+            e=all.find(el=>{
+                const c=(el.className||'').toString();
+                const t=(el.textContent||'').trim();
+                return c.includes('ActionBar_buttons') && t.includes('在线支付');
+            });
+            // 全页可见的、文字含「在线支付」的可点击元素
+            if(!e) e=all.find(el=>{
+                const t=(el.tagName||'');
+                const txt=(el.textContent||'').trim();
+                return (t==='TARO-BUTTON-CORE'||t==='BUTTON'||t==='A') && txt.includes('在线支付') && el.offsetParent!==null;
+            });
+        }
         if(!e) return {ok:false};
         e.scrollIntoView({block:'center'});
         const r=e.getBoundingClientRect();
@@ -1000,15 +1058,20 @@ def submit_order(sku=DEFAULT_SKU, qty=1, ensure_checkout=True):
         pg.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
     except Exception:
         pass
-    time.sleep(1.5)
-    # 2) 若 1.5s 内未跳转，用 DOM .click() 兜底（命中真实处理元素，
-    #    Taro 按钮的 onClick 绑定在内部 <button> 上，坐标偶发落空时保底）
-    if not find_page("mpay.m.jd.com"):
+    # 2) 快速轮询 ~1.2s：跳转通常 <1s 完成，检测到立即进入取单号阶段；
+    #    超时未跳再用 DOM .click() 兜底（Taro 按钮的 onClick 绑定在内部 <button> 上，坐标偶发落空时保底）
+    jumped = False
+    for _ in range(8):
+        time.sleep(0.15)
+        mp = find_page("mpay.m.jd.com")
+        if mp and mp.get("url") not in baseline_mpay:
+            jumped = True
+            break
+    if not jumped:
         try:
             pg.eval_js("""(() => {
-                const all=[...document.querySelectorAll('*')];
-                let e=all.find(el=>{const c=(el.className||'').toString(); return el.tagName==='TARO-BUTTON-CORE' && c.includes('ActionBar_submit');});
-                if(!e) e=all.find(el=>{const c=(el.className||'').toString(); return c.includes('ActionBar_submit');});
+                let e=document.querySelector('taro-button-core[class*="ActionBar_submit"]')
+                    || document.querySelector('[class*="ActionBar_submit"]');
                 if(!e) return;
                 const real = e.querySelector('button, [class*="btn"], a') || e;
                 try { real.click(); } catch(_) { e.click(); }
@@ -1018,42 +1081,44 @@ def submit_order(sku=DEFAULT_SKU, qty=1, ensure_checkout=True):
     # 3) 轮询跳转：以浏览器级 /json/list（find_page）为准，免疫页面 websocket 跨域重置
     order_id = None
     pay_url = ""
-    for _ in range(40):  # 40 * 0.7s ≈ 28s
-        time.sleep(0.7)
+    for _ in range(80):  # 80 * 0.25s ≈ 20s
+        time.sleep(0.25)
+        # 只认点击提交后「新出现」的收银台（URL 不在点击前的 baseline 中），
+        # 否则浏览器里残留的旧收银台会被误判为本单成功。
         mp = find_page("mpay.m.jd.com")
-        if mp:
+        if mp and mp.get("url") not in baseline_mpay:
             pay_url = mp.get("url", "")
             m = re.search(r"orderId=([0-9]+)", pay_url)
             if m:
                 order_id = m.group(1)
             break
-        # 兜底：页面内读取（导航瞬间 websocket 可能断开，忽略异常）
+        # 兜底：trade 结算页自身导航到 mpay（同标签页提交，URL 变为新收银台）
         try:
             url = pg.eval_js("location.href") or ""
         except Exception:
             url = ""
-        if "mpay.m.jd.com" in url:
+        if "mpay.m.jd.com" in url and url not in baseline_mpay:
             pay_url = url
             m = re.search(r"orderId=([0-9]+)", url)
             if m:
                 order_id = m.group(1)
             break
+        # 兜底2：页面文本里出现 orderId（导航瞬间 websocket 可能断开，忽略异常）
         try:
             txt = pg.eval_js("document.body.innerText") or ""
         except Exception:
             txt = ""
-        m = re.search(r"orderId[=:]\s*([0-9]+)", txt)
-        if m:
-            order_id = m.group(1)
-            try:
-                pay_url = pg.eval_js("location.href") or ""
-            except Exception:
-                pay_url = ""
-            break
+        if "trade.m.jd.com/pay" not in url:  # 仅当本标签页已离开结算页时才采信文本
+            m = re.search(r"orderId[=:]\s*([0-9]+)", txt)
+            if m:
+                order_id = m.group(1)
+                pay_url = url
+                break
     if not pay_url:
         try:
             mp = find_page("mpay.m.jd.com")
-            pay_url = mp.get("url", "") if mp else ""
+            if mp and mp.get("url") not in baseline_mpay:
+                pay_url = mp.get("url", "")
         except Exception:
             pass
     try:
@@ -1062,7 +1127,7 @@ def submit_order(sku=DEFAULT_SKU, qty=1, ensure_checkout=True):
         pass
     if order_id:
         return {"ok": True, "order_id": order_id, "payment_url": pay_url}
-    return {"ok": False, "error": "点击后未检测到收银台跳转，请检查浏览器", "payment_url": pay_url}
+    return {"ok": False, "error": "点击提交后未生成新订单（未跳转到收银台）。可能原因：秒杀已无库存 / 京东风控拦截 / 需先勾选购买协议。请查看浏览器结算页实际状态", "payment_url": pay_url}
 
 
 def current_shop_page():

@@ -13,10 +13,13 @@
 """
 import atexit
 import json
+import os
 import queue
 import threading
 import time
 import concurrent.futures
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -35,11 +38,91 @@ logging.basicConfig(
 log = logging.getLogger("jd_gui")
 
 
+# ---- 手机提醒（Server 酱 / 方糖）：抢到后推送微信 ----
+# 配置存 jd_notify.json（不入库），结构：{"serverchan_key": "SCTxxxxx"}
+NOTIFY_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jd_notify.json")
+NOTIFY_CFG = {"serverchan_key": ""}
+
+
+def _load_notify_cfg():
+
+
+
+    global NOTIFY_CFG
+    try:
+        if os.path.exists(NOTIFY_CFG_PATH):
+            with open(NOTIFY_CFG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                NOTIFY_CFG.update({k: cfg[k] for k in ("serverchan_key",) if k in cfg})
+    except Exception as e:
+        log.warning("读取 jd_notify.json 失败：%s", e)
+
+
+def _save_notify_cfg(cfg):
+    global NOTIFY_CFG
+    NOTIFY_CFG.update({k: cfg.get(k, NOTIFY_CFG.get(k, "")) for k in ("serverchan_key",)})
+    try:
+        with open(NOTIFY_CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump(NOTIFY_CFG, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("写入 jd_notify.json 失败：%s", e)
+
+
+def notify(title, text):
+    """抢到后调用，推送微信（Server 酱）。失败静默不影响主流程。"""
+    key = NOTIFY_CFG.get("serverchan_key", "").strip()
+    if not key:
+        return {"ok": False, "error": "未配置 serverchan_key"}
+    try:
+        url = f"https://sctapi.ftqq.com/{key}.send"
+        data = urllib.parse.urlencode({"title": title, "desp": text}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        # sctapi.ftqq.com 是公网，走系统默认代理出网（本机代理环境变量）
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+        try:
+            j = json.loads(body)
+            ok = bool(j.get("code") == 0 or j.get("data"))
+        except Exception:
+            ok = ("ok" in body)
+        log.info("Server 酱推送 %s：%s", "成功" if ok else "失败", body[:120])
+        return {"ok": ok, "raw": body[:200]}
+    except Exception as e:
+        log.warning("Server 酱推送异常：%s", e)
+        return {"ok": False, "error": str(e)}
+
+
+_load_notify_cfg()
+
+
+def _notify_success(task, res):
+    """抢到后组装并推送微信提醒。"""
+    order_id = res.get("order_id") or res.get("orderId") or ""
+    sku = task.get("sku", "")
+    qty = task.get("qty", 1)
+    at_str = task.get("at_str", "")
+    desp = (
+        f"🎉 抢到了！\n"
+        f"商品 SKU：{sku}\n"
+        f"数量：{qty}\n"
+        f"订单号：{order_id}\n"
+        f"定时：{at_str}\n"
+        f"请到京东 App「待支付」30 分钟内付款，否则订单自动取消。"
+    )
+    try:
+        notify("🎉 京东抢购成功", desp)
+    except Exception as e:
+        log.warning("推送成功提醒异常：%s", e)
+
+
 def _summ(v):
     """把大响应 dict 压成关键字段，避免日志刷屏。"""
     if isinstance(v, dict):
         keys = ("ok", "error", "sku", "from", "status",
-                "chrome_connected", "logged_in", "has_checkout", "has_payment")
+                "chrome_connected", "logged_in", "has_checkout", "has_payment",
+                "order_id")
         return {k: v.get(k) for k in keys if k in v}
     return v
 
@@ -78,10 +161,10 @@ _BROWSER_THREAD = threading.Thread(target=_browser_worker_loop, daemon=True, nam
 _BROWSER_THREAD.start()
 
 
-def browser_call(func, *args, timeout=35):
-    """把 func(*args) 放到 Playwright 专属线程执行并等待结果。"""
+def browser_call(func, *args, timeout=35, **kwargs):
+    """把 func(*args, **kwargs) 放到浏览器专属线程执行并等待结果。"""
     result_q = queue.Queue()
-    _BROWSER_Q.put((result_q, func, args, {}))
+    _BROWSER_Q.put((result_q, func, args, kwargs))
     try:
         ok, value = result_q.get(timeout=timeout)
     except queue.Empty:
@@ -196,35 +279,82 @@ def _run_scheduled(task):
     interval = max(0.5, float(task.get("interval", 2)))
     max_tries = int(task.get("max_tries", 0))  # 0 = 无限循环直到抢到/取消
 
-    # 1) 等待到点
+    # 1) 预热 + 等待到点
+    prep_target = None
+    if task.get("prep"):
+        prep_seconds = float(task.get("prep_seconds", 3))
+        prep_at = task["at"] - timedelta(seconds=prep_seconds)
+        prep_wait = (prep_at - datetime.now()).total_seconds()
+        if prep_wait > 0:
+            pw = 0.0
+            while pw < prep_wait:
+                with SCHED_LOCK:
+                    if SCHEDULED.get(tid, {}).get("cancelled"):
+                        SCHEDULED[tid]["status"] = "cancelled"
+                        SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
+                        return
+                step = min(1.0, prep_wait - pw)
+                time.sleep(step)
+                pw += step
+        # 提前打开并保留结算页，到点直接提交，压低开抢瞬间延迟
+        try:
+            pr = browser_call(jd.checkout, task["sku"], task["qty"], keep_open=True, timeout=40)
+            if pr.get("ok"):
+                prep_target = pr.get("target_id")
+        except Exception:
+            prep_target = None
     delay = (task["at"] - datetime.now()).total_seconds()
-    slept = 0.0
-    while slept < delay:
-        with SCHED_LOCK:
-            if SCHEDULED.get(tid, {}).get("cancelled"):
-                SCHEDULED[tid]["status"] = "cancelled"
-                SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
-                return
-        step = min(1.0, delay - slept)
-        time.sleep(step)
-        slept += step
+    if delay > 0:
+        slept = 0.0
+        while slept < delay:
+            with SCHED_LOCK:
+                if SCHEDULED.get(tid, {}).get("cancelled"):
+                    SCHEDULED[tid]["status"] = "cancelled"
+                    SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
+                    return
+            step = min(1.0, delay - slept)
+            time.sleep(step)
+            slept += step
     with SCHED_LOCK:
         if SCHEDULED.get(tid, {}).get("cancelled"):
             SCHEDULED[tid]["status"] = "cancelled"
             SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
             return
 
-    # 2) 单次模式（与原逻辑一致）
+    # 2) 单次模式（与原逻辑一致，优先用预热页）
     if not loop:
         with SCHED_LOCK:
             SCHEDULED[tid]["status"] = "running"
-        res = browser_call(_fire, task["sku"], task["qty"], task["concurrency"], task["retries"], timeout=80)
+        if prep_target:
+            res = browser_call(jd.submit_order, task["sku"], task["qty"], False,
+                               target_id=prep_target, timeout=40)
+            if not res.get("ok"):
+                res = browser_call(_fire, task["sku"], task["qty"], task["concurrency"],
+                                   task["retries"], timeout=80)
+        else:
+            res = browser_call(_fire, task["sku"], task["qty"], task["concurrency"],
+                               task["retries"], timeout=80)
         with SCHED_LOCK:
             SCHEDULED[tid]["status"] = "done" if res.get("ok") else "error"
             SCHEDULED[tid]["result"] = res
+        if res.get("ok"):
+            _notify_success(task, res)
         return
 
-    # 3) 循环模式：到点后每 interval 秒一次 checkout+submit，直到抢到/取消/达上限
+    # 3) 循环模式：先打预热一枪（复用提前打开的结算页），失败再进入常规循环
+    if prep_target:
+        with SCHED_LOCK:
+            SCHEDULED[tid]["status"] = "running"
+        sp = browser_call(jd.submit_order, task["sku"], task["qty"], False,
+                          target_id=prep_target, timeout=40)
+        if sp.get("ok"):
+            with SCHED_LOCK:
+                SCHEDULED[tid]["status"] = "done"
+                SCHEDULED[tid]["result"] = sp
+                SCHEDULED[tid]["tries"] = 1
+            _notify_success(task, sp)
+            return
+    # 常规循环：到点后每 interval 秒一次 checkout+submit，直到抢到/取消/达上限
     tries = 0
     risk_streak = 0
     last_err = ""
@@ -255,6 +385,7 @@ def _run_scheduled(task):
                         SCHEDULED[tid]["status"] = "done"
                         SCHEDULED[tid]["result"] = sub
                         SCHEDULED[tid]["tries"] = tries
+                    _notify_success(task, sub)
                     return
                 risk_streak = 0
                 pause = interval
@@ -285,6 +416,8 @@ def schedule_submit(data):
     loop = bool(data.get("loop", False))
     interval = max(0.5, float(data.get("interval", 2)))
     max_tries = max(0, int(data.get("max_tries", 0)))
+    prep = bool(data.get("prep", False))
+    prep_seconds = max(1, int(data.get("prep_seconds", 3)))
     at = parse_schedule_time(data.get("at", ""))
     if at <= datetime.now():
         raise ValueError("定时必须晚于当前时间")
@@ -298,6 +431,7 @@ def schedule_submit(data):
             "id": tid, "sku": sku, "qty": qty, "concurrency": conc,
             "retries": retries, "at": at, "loop": loop,
             "interval": interval, "max_tries": max_tries, "tries": 0,
+            "prep": prep, "prep_seconds": prep_seconds,
             "note": "", "last_error": "",
             "at_str": at.strftime("%Y-%m-%d %H:%M:%S"),
             "status": "pending", "result": None,
@@ -347,7 +481,7 @@ HTML = r"""<!DOCTYPE html>
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
 <meta http-equiv="Pragma" content="no-cache" />
 <meta http-equiv="Expires" content="0" />
-<title>京东抢购助手 v2026-07-23.4</title>
+<title>京东抢购助手 v2026-07-24.1</title>
 <style>
   :root{
     --bg:#f5f5f7; --card:#ffffff; --ink:#1d1d1f; --ink-2:#6e6e73; --line:#e8e8ed;
@@ -500,9 +634,29 @@ HTML = r"""<!DOCTYPE html>
       <input type="text" id="interval4" value="2" style="flex:0 0 64px;" title="每轮提交之间的最小间隔秒数；被京东风控时会自动拉长暂停">
       <span class="muted">秒（京东风控时自动拉长暂停）</span>
     </div>
+    <label class="switch" style="margin-top:10px;">
+      <input type="checkbox" id="prepChk"> 预热（开抢前提前打开结算页，整点直接提交，延迟最低）
+    </label>
+    <div class="row" style="margin-top:8px; align-items:center;">
+      <span class="muted">提前</span>
+      <input type="text" id="prepSec4" value="3" style="flex:0 0 56px;" title="开抢前多少秒提前打开结算页">
+      <span class="muted">秒预热</span>
+    </div>
     <div class="note">⚠️ 立即抢购会真实提交订单并跳转收银台（<b>会产生订单需支付</b>）。并发数&gt;1 可能生成多笔订单；定时抢购到点由后台自动执行，关掉页面也不影响。</div>
     <div id="checkout-result" class="kv" style="margin-top:12px;"></div>
     <pre id="out-submit">—</pre>
+  </div>
+
+  <!-- 手机提醒（Server 酱） -->
+  <div class="card">
+    <h2>📱 手机提醒（Server 酱）</h2>
+    <div class="muted">抢到后会推送微信提醒。注册 <a href="https://sct.ftqq.com" target="_blank" rel="noreferrer">Server 酱</a> 拿到 SendKey（SCT 开头），填下方保存即可。每次抢到自动推送到你微信。</div>
+    <div class="row" style="margin-top:10px;">
+      <input type="text" id="scKey" placeholder="Server 酱 SendKey，如 SCTxxxxx">
+      <button class="ghost" onclick="saveNotify()">保存</button>
+      <button class="ghost" onclick="testNotify()">测试推送</button>
+    </div>
+    <div class="muted" id="notify-hint" style="margin-top:6px;"></div>
   </div>
 
   <!-- 定时任务 -->
@@ -551,13 +705,9 @@ function updateStatusActions(d){
   const launch=document.getElementById('btn-launch');
   const login=document.getElementById('btn-login');
   if(!launch||!login) return;
-  if(!d.chrome_connected){
-    launch.style.display=''; login.style.display='none';
-  } else if(!d.logged_in){
-    launch.style.display=''; login.style.display='';
-  } else {
-    launch.style.display=''; login.style.display='none';
-  }
+  // Chrome 未连接时才需要「启动调试 Chrome」；只要没登录就始终显示「去登录」入口
+  launch.style.display = d.chrome_connected ? 'none' : '';
+  login.style.display  = d.logged_in ? 'none' : '';
 }
 // 切换「后台无窗口」即重启调试 Chrome 切换窗口模式（登录态保留在 Chrome profile / user-data-dir，无需 states/）
 function onHeadlessChange(){ launchChrome(); }
@@ -582,15 +732,20 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 // 下单前守卫：未登录则自动打开登录页并轮询等待完成，避免跳过登录直接 checkout 失败
 async function ensureLoggedIn(o){
   let st;
+  // 先查缓存状态（前端每 3s 自动轮询保持缓存新鲜，命中时毫秒级返回）；
+  // 只有缓存显示未登录时才强制探测（真实探测要开标签页，约 2~3s）
   try { st = await api('/api/status'); } catch(e){ st = {logged_in:false}; }
-  if(st.logged_in){ jd_logged_in = true; return true; }
+  if(!st.logged_in){
+    try { st = await api('/api/status', {force:true}); } catch(e){}
+  }
+  if(st && st.logged_in){ jd_logged_in = true; return true; }
   if(o) o.textContent = '未登录：正在打开登录页，请在弹出的浏览器窗口完成扫码 / 短信登录…';
   try { await api('/api/open_login', {sku:getSku(), qty:getQty()}); }
   catch(e){ if(o){ o.className='err'; o.textContent='打开登录页失败：'+e; } return false; }
   if(o) o.textContent = '登录页已打开，等待你完成登录（最多 120 秒）…';
   for(let i=0;i<60;i++){
     await sleep(2000);
-    try { st = await api('/api/status'); } catch(e){ continue; }
+    try { st = await api('/api/status', {force:true}); } catch(e){ continue; }
     if(st.logged_in){ jd_logged_in = true; if(o) o.textContent='✅ 登录成功，继续抢购…'; refreshStatus(); return true; }
   }
   jd_logged_in = false;
@@ -661,7 +816,7 @@ async function logoutAccount(){
   hint.textContent = '正在注销「'+(jd_active_account||'')+'」…';
   try{
     const d = await api('/api/account_logout', {name: jd_active_account});
-    if(d.ok){ alert(d.message||'已注销'); refreshStatus(); loadAccounts(); }
+    if(d.ok){ alert(d.message||'已注销'); refreshStatus(); loadAccounts(); openLogin(); }
     else alert('注销失败：'+(d.error||''));
   }catch(e){ alert('错误：'+e); }
 }
@@ -718,10 +873,19 @@ async function launchChrome(){
 }
 async function openLogin(){
   const o = document.getElementById('act-log');
-  if(o){ o.className=''; o.textContent='正在打开登录页（请在弹出的窗口完成登录）…'; }
+  if(o){ o.className=''; o.textContent='准备登录（必要时先以窗口模式启动 Chrome）…'; }
   try{
+    // 登录需肉眼扫码 → 确保 Chrome 已启动且为窗口模式（可见）
+    let st = {chrome_connected:false};
+    try { st = await api('/api/status'); } catch(e){}
+    if(!st.chrome_connected){
+      document.getElementById('headlessChk').checked = false;  // 取消后台无窗口，保证登录窗口可见
+      await api('/api/launch_chrome', {headless:false});
+      await sleep(2000);
+    }
+    // open_login 后端会自动切到窗口模式并打开登录页
     const d = await api('/api/open_login', {sku:getSku(), qty:getQty()});
-    if(o) o.textContent = JSON.stringify(d, null, 2);
+    if(o) o.textContent = '✅ 已打开登录页，请在弹出的 Chrome 窗口完成扫码 / 短信登录；登录成功后状态栏「登录态」会变「已登录」。';
     refreshStatus();
   }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
 }
@@ -813,7 +977,9 @@ async function scheduleSubmit(){
       qty: parseInt(val('qty4')||'1'),
       concurrency: parseInt(val('conc4')||'1'),
       retries: parseInt(val('retry4')||'0'),
-      at: at, loop: loop, interval: interval
+      at: at, loop: loop, interval: interval,
+      prep: document.getElementById('prepChk').checked,
+      prep_seconds: parseInt(val('prepSec4')||'3')
     });
     o.textContent = JSON.stringify(d, null, 2);
     refreshTasks();
@@ -846,6 +1012,30 @@ async function refreshTasks(){
   try{ const d = await api('/api/submit_tasks', {}); renderTasks(d); }
   catch(e){ console.log(e); }
 }
+async function saveNotify(){
+  const k = (document.getElementById('scKey').value||'').trim();
+  const h = document.getElementById('notify-hint');
+  try{
+    const d = await api('/api/notify_config', {serverchan_key: k});
+    h.textContent = d.ok ? (d.configured ? '✅ 已保存，抢到会推微信' : '已清空配置') : ('❌ '+JSON.stringify(d));
+  }catch(e){ h.textContent = '错误：'+e; }
+}
+async function testNotify(){
+  const h = document.getElementById('notify-hint');
+  h.textContent = '推送中…';
+  try{
+    const d = await api('/api/notify_config', {test: true});
+    h.textContent = d.ok ? '📱 测试推送已发送，请查收微信' : ('❌ '+(d.error||JSON.stringify(d)));
+  }catch(e){ h.textContent = '错误：'+e; }
+}
+async function loadNotify(){
+  try{
+    const d = await api('/api/notify_config', {});
+    if(d.ok && d.configured){
+      document.getElementById('notify-hint').textContent = '当前已配置：'+d.serverchan_key;
+    }
+  }catch(e){}
+}
 async function cancelSubmit(id){
   if(!id) return;
   if(!confirm('取消定时任务 '+id+'？')) return;
@@ -858,6 +1048,7 @@ async function cancelSubmit(id){
 refreshStatus();
 refreshTasks();
 loadAccounts();
+loadNotify();
 // 状态与任务自动轮询，无需手动刷新
 setInterval(refreshStatus, 3000);
 setInterval(refreshTasks, 5000);
@@ -906,7 +1097,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if self.path == "/api/status":
-                v = run(jd.chrome_status)
+                v = run(jd.chrome_status, bool(data.get("force", False)))
             elif self.path == "/api/launch_chrome":
                 hl = bool(data.get("headless", True))
                 if CURRENT_HEADLESS["val"] != hl:
@@ -948,6 +1139,18 @@ class Handler(BaseHTTPRequestHandler):
                 v = list_tasks()
             elif self.path == "/api/submit_cancel":
                 v = cancel_task(data.get("task_id"))
+            elif self.path == "/api/notify_config":
+                if data.get("test"):
+                    v = notify("🔔 测试推送", "如果你收到这条微信，说明手机提醒已配置成功。")
+                elif "serverchan_key" in data:
+                    key = (data.get("serverchan_key") or "").strip()
+                    _save_notify_cfg({"serverchan_key": key})
+                    v = {"ok": True, "configured": bool(key)}
+                else:
+                    key = NOTIFY_CFG.get("serverchan_key", "")
+                    v = {"ok": True, "configured": bool(key),
+                         "serverchan_key": (key[:4] + "****" + key[-4:]) if len(key) > 8
+                                         else (key[:1] + "****" if key else "")}
             elif self.path == "/api/accounts":
                 v = run(jd.list_accounts)
             elif self.path == "/api/account_switch":

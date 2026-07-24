@@ -18,3 +18,9 @@ __pycache__/
 
 # 截图等二进制
 *.png
+
+# 推送配置（含 Server 酱密钥，禁止提交）
+jd_notify.json
+
+# 本地工作记忆 / 诊断日志 / 临时脚本（含记忆与运行日志，勿入库）
+.codebuddy/
