@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>京东抢购助手 v2026-07-24.java</title>
+<style>
+  :root{
+    --bg:#f5f5f7; --card:#ffffff; --ink:#1d1d1f; --ink-2:#6e6e73; --line:#e8e8ed;
+    --blue:#0071e3; --blue-press:#0077ed; --red:#ff3b30; --red-press:#ff453a;
+    --green:#34c759; --gray-6:#8e8e93; --radius:18px;
+    --shadow:0 1px 3px rgba(0,0,0,.04), 0 10px 30px rgba(0,0,0,.05);
+  }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","PingFang SC","Helvetica Neue",sans-serif;
+        background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased; line-height:1.5; }
+  .wrap{ max-width:760px; margin:0 auto; padding:28px 18px 60px; }
+  .app-header{ display:flex; align-items:center; gap:13px; margin:4px 0 22px; }
+  .app-header .logo{ width:42px; height:42px; border-radius:12px; background:linear-gradient(135deg,#ff7a7a,#e1251b);
+        display:flex; align-items:center; justify-content:center; color:#fff; font-weight:700; font-size:21px;
+        box-shadow:0 6px 16px rgba(225,37,27,.28); }
+  .app-header h1{ font-size:23px; font-weight:700; letter-spacing:-.02em; margin:0; }
+  .app-header .sub{ font-size:13px; color:var(--ink-2); margin-top:2px; }
+  .card{ background:var(--card); border-radius:var(--radius); padding:20px; margin-bottom:16px; box-shadow:var(--shadow); }
+  .card h2{ font-size:17px; font-weight:600; margin:0 0 14px; letter-spacing:-.01em; display:flex; align-items:center; }
+  .step-badge{ display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 7px;
+        border-radius:50%; background:var(--blue); color:#fff; font-size:12px; font-weight:600; margin-right:10px; }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .grid2{ display:grid; grid-template-columns:repeat(2,1fr); gap:16px; }
+  @media(max-width:520px){ .grid2{ grid-template-columns:1fr; } }
+  .field{ display:flex; flex-direction:column; gap:6px; }
+  .field label{ font-size:13px; font-weight:500; color:var(--ink-2); }
+  .field label .tag{ font-size:11px; font-weight:400; padding:2px 6px; border-radius:4px; margin-left:4px; display:inline-block; }
+  .field label .tag.required{ background:var(--red); color:#fff; }
+  .field label .tag.hint{ background:#e5e5ea; color:var(--ink-2); }
+  input[type=text]{ padding:11px 14px; border:1px solid var(--line); border-radius:12px; font-size:15px; flex:1; min-width:120px;
+        background:#fbfbfd; outline:none; transition:border-color .2s, box-shadow .2s, background .2s; }
+  input[type=text]:focus{ border-color:var(--blue); box-shadow:0 0 0 4px rgba(0,113,227,.12); background:#fff; }
+  button{ font-family:inherit; background:var(--blue); color:#fff; border:none; border-radius:980px; padding:11px 20px;
+        font-size:15px; font-weight:500; cursor:pointer; transition:transform .12s, background .2s, box-shadow .2s; }
+  button:hover{ background:var(--blue-press); }
+  button:active{ transform:scale(.97); }
+  button.ghost{ background:#f0f0f3; color:var(--ink); }
+  button.ghost:hover{ background:#e6e6ea; }
+  button.danger{ background:var(--red); }
+  button.danger:hover{ background:var(--red-press); }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  .switch{ display:inline-flex; align-items:center; gap:6px; cursor:pointer; color:var(--ink-2); font-size:13px; }
+  .status{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .badge{ font-size:12.5px; font-weight:500; padding:5px 13px; border-radius:980px; background:#f0f0f3; color:var(--ink-2); transition:all .2s; }
+  .badge.on{ background:rgba(52,199,89,.15); color:#1c7c34; }
+  .badge.off{ background:rgba(255,59,48,.13); color:#c9342b; }
+  pre{ white-space:pre-wrap; word-break:break-all; background:#fafafa; border:1px solid var(--line); border-radius:12px;
+        padding:11px; font-size:13px; max-height:260px; overflow:auto; margin:8px 0 0; }
+  .kv{ font-size:14px; line-height:1.9; }
+  .kv b{ color:var(--red); }
+  .ok{ color:var(--green); }
+  .err{ color:var(--red); }
+  .muted{ color:var(--ink-2); font-size:12.5px; }
+  #resolve-hint{ white-space:pre-wrap; word-break:break-all; line-height:1.5; max-height:200px; overflow:auto; }
+  #resolve-hint.err{ color:var(--red); }
+  #resolve-hint.ok{ color:var(--green); }
+  .note{ font-size:12.5px; color:#8a6d3b; background:#fff8e9; border:1px solid #f3e2bd; padding:10px 12px; border-radius:12px; margin-top:12px; line-height:1.6; }
+  .seg{ display:inline-flex; background:#e8e8ed; border-radius:980px; padding:3px; gap:2px; flex-wrap:wrap; max-width:100%; }
+  .seg button{ border:none; background:transparent; color:var(--ink-2); border-radius:980px; padding:7px 16px;
+        font-size:14px; font-weight:500; cursor:pointer; transition:all .2s; }
+  .seg button:hover{ color:var(--ink); }
+  .seg button.active{ background:#fff; color:var(--ink); box-shadow:0 1px 4px rgba(0,0,0,.12); }
+  .seg button.add{ color:var(--blue); font-weight:600; }
+  ul.tasks{ margin:6px 0 0; padding-left:18px; }
+  ul.tasks li{ margin:3px 0; font-size:13px; }
+  .footer{ text-align:center; margin:14px 0 4px; }
+  button.sm{ padding:7px 14px; font-size:13px; }
+  .status-actions{ margin-top:12px; flex-wrap:wrap; }
+  .buy-btn{ font-size:16px; padding:12px 26px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="app-header">
+    <div class="logo">京</div>
+    <div>
+      <h1>京东抢购助手</h1>
+      <div class="sub">调试 Chrome 驱动 · 多账号 · 一键抢购</div>
+    </div>
+  </div>
+
+  <!-- 状态栏：自动轮询，无需手动刷新 -->
+  <div class="card">
+    <div class="status" id="status">
+      <span class="badge" id="b-account">账号：检测中…</span>
+      <span class="badge" id="b-chrome">Chrome：检测中…</span>
+      <span class="badge" id="b-login">登录态：检测中…</span>
+      <span class="badge" id="b-checkout">结算页：检测中…</span>
+    </div>
+    <div class="row status-actions">
+      <button class="ghost sm" id="btn-launch" onclick="launchChrome()">启动调试 Chrome</button>
+      <button class="ghost sm" id="btn-login" onclick="openLogin()" style="display:none;">去登录</button>
+      <label class="switch"><input type="checkbox" id="headlessChk" checked onchange="onHeadlessChange()"> 后台无窗口</label>
+      <span class="muted" id="status-ts"></span>
+    </div>
+    <pre id="act-log" class="muted">—</pre>
+  </div>
+
+  <!-- 账号切换 -->
+  <div class="card">
+    <h2>账号</h2>
+    <div class="row" style="align-items:center;">
+      <div class="seg" id="account-seg"></div>
+      <button class="ghost" onclick="addAccount()">+ 新增</button>
+      <button class="danger ghost" onclick="logoutAccount()">注销登录</button>
+    </div>
+    <div class="muted" id="account-hint" style="margin-top:10px;">正在读取账号…</div>
+  </div>
+
+  <!-- 抢购面板（原 ②③ ④ 合并为一步） -->
+  <div class="card">
+    <h2>🚀 抢购</h2>
+    <div class="muted">粘贴分享链接自动解析 SKU，或手动填 SKU。点「立即抢购」会<b>自动打开结算页并下单</b>（无需先单独核对）。</div>
+    <div class="row" style="margin-top:12px;">
+      <input type="text" id="shareLink" placeholder="粘贴京东分享短链 / 商品页链接，自动解析 SKU">
+      <button class="ghost" onclick="resolveLink()">解析链接</button>
+    </div>
+    <div class="muted" id="resolve-hint" style="margin-top:6px;">支持 3.cn 短链 / item.jd.com 链接 / 直接填 SKU 数字</div>
+    <div class="grid2" style="margin-top:16px;">
+      <div class="field">
+        <label for="sku4">商品 SKU <span class="tag required">必填</span></label>
+        <input type="text" id="sku4" value="100342780502" title="京东商品编号，填数字">
+      </div>
+      <div class="field">
+        <label for="qty4">购买数量</label>
+        <input type="text" id="qty4" value="1" title="购买件数">
+      </div>
+      <div class="field">
+        <label for="conc4">并发数 <span class="tag hint">建议保持 1</span></label>
+        <input type="text" id="conc4" value="1" title="同一时刻连续点击次数。>1 会生成多笔订单且极易触发京东风控，一般保持 1">
+      </div>
+      <div class="field">
+        <label for="retry4">失败重试次数 <span class="tag hint">一般 0</span></label>
+        <input type="text" id="retry4" value="0" title="首次提交失败后重试几次。>0 可能延长总耗时，一般保持 0">
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button class="danger buy-btn" id="btn-buy" onclick="doSubmit()">🚀 立即抢购</button>
+      <button class="ghost" onclick="doCheckout()">仅打开结算页核对</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <input type="text" id="at4" placeholder="定时时间，如 20:00">
+      <button class="ghost" onclick="scheduleSubmit()">⏰ 定时抢购</button>
+    </div>
+    <label class="switch" style="margin-top:10px;">
+      <input type="checkbox" id="loopChk" onchange="onLoopChange()"> 循环到抢到为止（到点后每间隔多次提交，直到抢到）
+    </label>
+    <div class="row" id="loop-opts" style="margin-top:8px; align-items:center; display:none;">
+      <span class="muted">循环间隔</span>
+      <input type="text" id="interval4" value="2" style="flex:0 0 64px;" title="每轮提交之间的最小间隔秒数；被京东风控时会自动拉长暂停">
+      <span class="muted">秒（京东风控时自动拉长暂停）</span>
+    </div>
+    <label class="switch" style="margin-top:10px;">
+      <input type="checkbox" id="prepChk"> 预热（开抢前提前打开结算页，整点直接提交，延迟最低）
+    </label>
+    <div class="row" style="margin-top:8px; align-items:center;">
+      <span class="muted">提前</span>
+      <input type="text" id="prepSec4" value="3" style="flex:0 0 56px;" title="开抢前多少秒提前打开结算页">
+      <span class="muted">秒预热</span>
+    </div>
+    <div class="note">⚠️ 立即抢购会真实提交订单并跳转收银台（<b>会产生订单需支付</b>）。并发数&gt;1 可能生成多笔订单；定时抢购到点由后台自动执行，关掉页面也不影响。</div>
+    <div id="checkout-result" class="kv" style="margin-top:12px;"></div>
+    <pre id="out-submit">—</pre>
+  </div>
+
+  <!-- 手机提醒（Server 酱） -->
+  <div class="card">
+    <h2>📱 手机提醒（Server 酱）</h2>
+    <div class="muted">抢到后会推送微信提醒。注册 <a href="https://sct.ftqq.com" target="_blank" rel="noreferrer">Server 酱</a> 拿到 SendKey（SCT 开头），填下方保存即可。每次抢到自动推送到你微信。</div>
+    <div class="row" style="margin-top:10px;">
+      <input type="text" id="scKey" placeholder="Server 酱 SendKey，如 SCTxxxxx">
+      <button class="ghost" onclick="saveNotify()">保存</button>
+      <button class="ghost" onclick="testNotify()">测试推送</button>
+    </div>
+    <div class="muted" id="notify-hint" style="margin-top:6px;"></div>
+  </div>
+
+  <!-- 定时任务 -->
+  <div class="card">
+    <h2>定时任务</h2>
+    <div class="row" style="margin-top:4px;">
+      <button class="ghost sm" onclick="refreshTasks()">刷新任务</button>
+    </div>
+    <ul class="tasks" id="tasks" style="margin-top:8px;"><li class="muted">无</li></ul>
+  </div>
+
+  <div class="muted footer">Spring Boot Java 版 · 与 Python 版共享调试 Chrome（9222）与登录态</div>
+</div>
+
+<script>
+function setBadge(id, text, on, off){
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'badge ' + (on ? 'on' : (off ? 'off' : ''));
+}
+async function refreshStatus(){
+  try{
+    const r = await fetch('/api/status', {method:'POST'});
+    const d = await r.json();
+    jd_chrome_ok = !!d.chrome_connected;
+    jd_logged_in = !!d.logged_in;
+    setBadge('b-chrome', 'Chrome：'+(d.chrome_connected?'已连接':'未连接'), d.chrome_connected, !d.chrome_connected);
+    setBadge('b-login', '登录态：'+(d.logged_in?'已登录':'未登录'), d.logged_in, !d.logged_in);
+    setBadge('b-checkout', '结算页：'+(d.has_checkout?'已打开':'未打开'), d.has_checkout, !d.has_checkout);
+    if(d.active_account){
+      jd_active_account = d.active_account;
+      setBadge('b-account', '当前账号：'+d.active_account, d.logged_in, !d.logged_in);
+    }
+    updateStatusActions(d);
+    const ts=document.getElementById('status-ts');
+    if(ts) ts.textContent='状态更新于 '+new Date().toLocaleTimeString();
+    if(d.detail) console.log(d.detail);
+  }catch(e){
+    const ts=document.getElementById('status-ts');
+    if(ts) ts.textContent='状态获取失败：'+e;
+  }
+}
+
+// 根据状态上下文自动显隐「启动 Chrome / 去登录」按钮，减少多余操作
+function updateStatusActions(d){
+  const launch=document.getElementById('btn-launch');
+  const login=document.getElementById('btn-login');
+  if(!launch||!login) return;
+  // Chrome 未连接时才需要「启动调试 Chrome」；只要没登录就始终显示「去登录」入口
+  launch.style.display = d.chrome_connected ? 'none' : '';
+  login.style.display  = d.logged_in ? 'none' : '';
+}
+// 切换「后台无窗口」即重启调试 Chrome 切换窗口模式（登录态保留在 Chrome profile / user-data-dir，无需 states/）
+function onHeadlessChange(){ launchChrome(); }
+
+async function api(path, body){
+  // 用 text() 拿原始响应体（无论后端返回 JSON / HTML 错误页 / 被中间设备改写的内容）
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+  const raw = await r.text();
+  let d;
+  try { d = JSON.parse(raw); }
+  catch(e){
+    // 响应不是合法 JSON——很可能是中间设备（代理/扩展）改写或拦截
+    throw {__raw_response:true, status:r.status, content_type:r.headers.get('content-type')||'', body:raw.slice(0,500)};
+  }
+  // 把原始响应体附带进去（调试用，前端可以打印）
+  d.__raw = raw.slice(0,500);
+  d.__status = r.status;
+  return d;
+}
+function val(id){ return document.getElementById(id).value.trim(); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+// 下单前守卫：未登录则自动打开登录页并轮询等待完成，避免跳过登录直接 checkout 失败
+async function ensureLoggedIn(o){
+  let st;
+  // 先查缓存状态（前端每 3s 自动轮询保持缓存新鲜，命中时毫秒级返回）；
+  // 只有缓存显示未登录时才强制探测（真实探测要开标签页，约 2~3s）
+  try { st = await api('/api/status'); } catch(e){ st = {logged_in:false}; }
+  if(!st.logged_in){
+    try { st = await api('/api/status', {force:true}); } catch(e){}
+  }
+  if(st && st.logged_in){ jd_logged_in = true; return true; }
+  if(o) o.textContent = '未登录：正在打开登录页，请在弹出的浏览器窗口完成扫码 / 短信登录…';
+  try { await api('/api/open_login', {sku:getSku(), qty:getQty()}); }
+  catch(e){ if(o){ o.className='err'; o.textContent='打开登录页失败：'+e; } return false; }
+  if(o) o.textContent = '登录页已打开，等待你完成登录（最多 120 秒）…';
+  for(let i=0;i<60;i++){
+    await sleep(2000);
+    try { st = await api('/api/status', {force:true}); } catch(e){ continue; }
+    if(st.logged_in){ jd_logged_in = true; if(o) o.textContent='✅ 登录成功，继续抢购…'; refreshStatus(); return true; }
+  }
+  jd_logged_in = false;
+  if(o){ o.className='err'; o.textContent='⏱️ 登录等待超时（120 秒）。请确认已在浏览器窗口完成登录后重试；也可直接点状态栏「去登录」。'; }
+  return false;
+}
+let jd_chrome_ok = false;  // 调试 Chrome 是否连接，供解析前预判
+let jd_headless = true;    // 当前后台无窗口模式（与界面勾选同步）
+let jd_active_account = ""; // 当前激活的京东账号名
+let jd_logged_in = false;  // 当前账号是否已登录京东（供下单前守卫判断）
+// SKU / 数量统一从 ④ 提交订单区读取（单一数据源，避免重复输入）
+function getSku(){ return val('sku4') || '100342780502'; }
+function getQty(){ return parseInt(val('qty4') || '1'); }
+// ---- 多账号切换 ----
+async function loadAccounts(){
+  try{
+    const d = await api('/api/accounts', {});
+    const seg = document.getElementById('account-seg');
+    seg.innerHTML = '';
+    (d.accounts||[]).forEach(a=>{
+      const b = document.createElement('button');
+      b.textContent = a.name;
+      if(a.name === d.active) b.className = 'active';
+      b.onclick = ()=> switchAccount(a.name);
+      seg.appendChild(b);
+    });
+    const hint = document.getElementById('account-hint');
+    let s = '当前账号：' + (d.active||'—');
+    const cur = (d.accounts||[]).find(a=>a.name===d.active);
+    if(cur && cur.note) s += '（'+cur.note+'）';
+    s += ' ｜ 切换为毫秒级（不重启浏览器），登录态由 Chrome profile（user-data-dir）按账号隔离保存';
+    hint.textContent = s;
+    jd_active_account = d.active;
+  }catch(e){ console.log(e); }
+}
+async function switchAccount(name){
+  if(name === jd_active_account){ return; }
+  const hint = document.getElementById('account-hint');
+  hint.textContent = '正在切换到「'+name+'」…（重启调试 Chrome）';
+  // 先把分段控件里目标标记为 active，给出即时反馈
+  document.querySelectorAll('#account-seg button').forEach(b=>{
+    b.classList.toggle('active', b.textContent === name);
+  });
+  try{
+    const d = await api('/api/account_switch', {name: name});
+    if(d.ok){
+      hint.textContent = '已切换到「'+name+'」，正在加载该账号登录态…';
+      setTimeout(()=>{ refreshStatus(); loadAccounts(); }, 1800);
+    } else {
+      hint.textContent = '切换失败：' + (d.error||'未知错误');
+      loadAccounts();
+    }
+  }catch(e){ hint.textContent = '切换错误：'+e; loadAccounts(); }
+}
+async function addAccount(){
+  const name = prompt('新账号名称（如：小号A）：');
+  if(!name) return;
+  const note = prompt('备注（可选，可填该账号的京东昵称）：','') || '';
+  try{
+    const d = await api('/api/account_add', {name: name, note: note});
+    if(d.ok){ alert(d.message || ('已新增 '+name)); loadAccounts(); }
+    else alert('添加失败：' + (d.error||''));
+  }catch(e){ alert('错误：'+e); }
+}
+async function logoutAccount(){
+  if(!confirm('确定注销当前账号「'+(jd_active_account||'默认账号')+'」的登录态吗？\n（仅清除本地保存的登录凭据，不影响京东账号本身）')) return;
+  const hint = document.getElementById('account-hint');
+  hint.textContent = '正在注销「'+(jd_active_account||'')+'」…';
+  try{
+    const d = await api('/api/account_logout', {name: jd_active_account});
+    if(d.ok){ alert(d.message||'已注销'); refreshStatus(); loadAccounts(); openLogin(); }
+    else alert('注销失败：'+(d.error||''));
+  }catch(e){ alert('错误：'+e); }
+}
+async function resolveLink(){
+  let link = val('shareLink').replace(/\r?\n/g, ' ').trim();  // 仅合并换行并去首尾空白，保留中间空格（避免把商品名/编号粘到 URL 上）
+  const hint = document.getElementById('resolve-hint');
+  if(!link){ alert('请先粘贴分享链接'); return; }
+  hint.className = 'muted';
+  hint.textContent = '解析中…（纯 HTTP 跟跳转，约 1 秒内）';
+  try{
+    const d = await api('/api/resolve', {url: link});
+    if(!d.ok){
+      let msg = '❌ 解析失败：'+(d.error||'未知错误');
+      const dbg = [];
+      if(d.from) dbg.push('来源: '+d.from);
+      if(d.trace) dbg.push('堆栈: '+d.trace);
+      if(d.final_url) dbg.push('最终URL: '+d.final_url);
+      if(d.api_func) dbg.push('接口: '+d.api_func);
+      // 关键诊断：如果原始响应体里没有 error 字符串，说明被中间设备改写过
+      if(d.__raw && (!d.error || d.__raw.indexOf(d.error)===-1)){
+        dbg.push('⚠️ 原始响应与 error 字段不一致（可能被代理/扩展改写）:');
+        dbg.push(d.__raw);
+      }
+      if(d.__status) dbg.push('HTTP 状态: '+d.__status);
+      if(dbg.length) msg += '\n—— 调试信息 ——\n'+dbg.join('\n');
+      hint.className = 'muted err';
+      hint.textContent = msg;
+      return;
+    }
+    document.getElementById('sku4').value = d.sku;
+    let ok = '✅ 已解析 SKU：'+d.sku+'（已填入上方）';
+    if(d.from) ok += '\n来源: '+d.from;
+    if(d.final_url) ok += '\n商品页: '+d.final_url;
+    hint.className = 'muted ok';
+    hint.textContent = ok;
+  }catch(e){
+    hint.className = 'muted err';
+    if(e && e.__raw_response){
+      hint.textContent = '❌ 响应不是合法 JSON（可能被代理/扩展拦截改写）\nHTTP 状态: '+e.status+'\nContent-Type: '+e.content_type+'\n原始响应体:\n'+e.body;
+    } else {
+      hint.textContent = '❌ 解析请求异常：'+e+'\n（请检查 GUI 服务是否在运行）';
+    }
+  }
+}
+async function launchChrome(){
+  const o = document.getElementById('act-log');
+  if(o){ o.className=''; o.textContent='启动调试 Chrome 中…'; }
+  const headless = document.getElementById('headlessChk').checked;
+  try{
+    const d = await api('/api/launch_chrome', {headless: headless});
+    if(o) o.textContent = JSON.stringify(d, null, 2);
+    if(d.ok){ jd_headless = headless; setTimeout(refreshStatus, 1500); }
+  }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
+}
+async function openLogin(){
+  const o = document.getElementById('act-log');
+  if(o){ o.className=''; o.textContent='准备登录（必要时先以窗口模式启动 Chrome）…'; }
+  try{
+    // 登录需肉眼扫码 → 确保 Chrome 已启动且为窗口模式（可见）
+    let st = {chrome_connected:false};
+    try { st = await api('/api/status'); } catch(e){}
+    if(!st.chrome_connected){
+      document.getElementById('headlessChk').checked = false;  // 取消后台无窗口，保证登录窗口可见
+      await api('/api/launch_chrome', {headless:false});
+      await sleep(2000);
+    }
+    // open_login 后端会自动切到窗口模式并打开登录页
+    const d = await api('/api/open_login', {sku:getSku(), qty:getQty()});
+    if(o) o.textContent = '✅ 已打开登录页，请在弹出的 Chrome 窗口完成扫码 / 短信登录；登录成功后状态栏「登录态」会变「已登录」。';
+    refreshStatus();
+  }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
+}
+async function doCheckout(){
+  const box = document.getElementById('checkout-result');
+  box.innerHTML = '打开中…';
+  try{
+    if(!await ensureLoggedIn(box)) return;  // 未登录先登录，再读结算页
+    const d = await api('/api/checkout', {sku:getSku(), qty:getQty()});
+    renderCheckout(box, d);
+    refreshStatus();
+  }catch(e){ box.innerHTML = '<span class="err">错误：'+e+'</span>'; }
+}
+async function doCheckoutRetry(){
+  const box = document.getElementById('checkout-result');
+  box.innerHTML = '重试中（已等风控冷却 2s）…';
+  try{
+    const d = await api('/api/checkout_retry', {sku:getSku(), qty:getQty()});
+    renderCheckout(box, d);
+    refreshStatus();
+  }catch(e){ box.innerHTML = '<span class="err">错误：'+e+'</span>'; }
+}
+function renderCheckout(box, d){
+  if(!d.ok){ box.innerHTML = '<span class="err">失败：'+(d.error||'')+'</span>'; return; }
+  if(d.risk_control){
+    let h = '<div class="note" style="color:var(--red);background:#fdeaea;border-color:#f5c6c6;">'
+          + '⚠️ <b>账号被京东风控拦截</b>：页面显示「活动异常火爆，已优先接入快速通道」。<br>'
+          + '这不是程序问题，是京东对频繁访问的临时限制。请：<br>'
+          + '1）暂停点击，等待 1~5 分钟让风控解除；<br>'
+          + '2）解除后点「重试（风控冷却后）」或「打开并核对」再读；<br>'
+          + '3）不要短时间内反复打开结算页，会加重风控。<br>'
+          + '（可在手机京东 App 正常操作下单）</div>';
+    box.innerHTML = h;
+    return;
+  }
+  let h = '';
+  h += '商品：<b>'+(d.product_name||'(未解析到名称)')+'</b><br>';
+  h += 'SKU：'+d.sku+' ｜ 数量(输入/页内)：'+d.qty_input+' / '+(d.qty_found??'—')+'<br>';
+  h += '价格：<b>'+(d.price?('¥'+d.price):'(未解析)')+'</b><br>';
+  if(d.address_hint) h += '地址：'+d.address_hint+'<br>';
+  if(d.phone) h += '手机号：<b>'+d.phone+'</b><br>';
+  h += '<details style="margin-top:8px;"><summary class="muted">查看结算页原文</summary><pre>'+((d.text_snippet||'').replace(/</g,'&lt;'))+'</pre></details>';
+  box.innerHTML = h;
+}
+async function doSubmit(){
+  const o = document.getElementById('out-submit');
+  const btn = document.getElementById('btn-buy');
+  const box = document.getElementById('checkout-result');
+  if(btn) btn.disabled = true;
+  if(o){ o.className=''; o.textContent='准备抢购（先确认登录态）…'; }
+  try{
+    // 0) 登录守卫：未登录先打开登录页并等待完成，再继续
+    if(!await ensureLoggedIn(o)) return;
+    // 1) 先解析结算页：让用户看清「买的是什么」，同时检测京东风控
+    const c = await api('/api/checkout', {sku:getSku(), qty:getQty()});
+    if(box) renderCheckout(box, c);
+    if(c.risk_control){
+      if(o) o.textContent = '⚠️ 账号被京东风控拦截，已停止提交（见上方说明）。请等待风控解除后再试，切勿连续点击。';
+      return; // 不提交，避免加重风控
+    }
+    // 2) 商品信息正常 → 真实提交（复用刚打开的结算页，无需再开一次）
+    if(o) o.textContent='抢购中（自动提交订单）…';
+    const d = await api('/api/submit', {
+      sku: getSku(),
+      qty: getQty(),
+      concurrency: parseInt(val('conc4')||'1'),
+      retries: parseInt(val('retry4')||'0')
+    });
+    if(o) o.textContent = JSON.stringify(d, null, 2);
+    refreshStatus(); refreshTasks();
+  }catch(e){ if(o){ o.className='err'; o.textContent='错误：'+e; } }
+  finally{
+    if(btn){
+      // 3 秒冷却：避免短时间连点反复打开结算页，触发京东风控
+      setTimeout(()=>{ btn.disabled=false; }, 3000);
+    }
+  }
+}
+async function scheduleSubmit(){
+  const at = val('at4');
+  if(!at){ alert('请先填写定时时间，如 20:00 或 2026-07-22 20:00:00'); return; }
+  const o = document.getElementById('out-submit');
+  o.className=''; o.textContent='安排中…';
+  const loop = document.getElementById('loopChk').checked;
+  const interval = parseFloat(val('interval4')||'2') || 2;
+  try{
+    const d = await api('/api/submit_schedule', {
+      sku: val('sku4')||'100342780502',
+      qty: parseInt(val('qty4')||'1'),
+      concurrency: parseInt(val('conc4')||'1'),
+      retries: parseInt(val('retry4')||'0'),
+      at: at, loop: loop, interval: interval,
+      prep: document.getElementById('prepChk').checked,
+      prep_seconds: parseInt(val('prepSec4')||'3')
+    });
+    o.textContent = JSON.stringify(d, null, 2);
+    refreshTasks();
+  }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+}
+function onLoopChange(){
+  const box = document.getElementById('loop-opts');
+  if(box) box.style.display = document.getElementById('loopChk').checked ? 'flex' : 'none';
+}
+function renderTasks(d){
+  const el = document.getElementById('tasks');
+  if(!d.ok || !d.tasks || !d.tasks.length){ el.innerHTML='<li class="muted">无</li>'; return; }
+  let h='';
+  for(const t of d.tasks){
+    const st=t.status;
+    const color = st==='done'?'var(--green)':(st==='error'?'var(--red)':(st==='cancelled'?'#999':'var(--blue)'));
+    const loopTag = t.loop ? ' [循环]' : '';
+    h += '<li>#'+t.id+loopTag+' @ '+t.at_str+' ['+t.sku+' ×'+t.qty+'] <b style="color:'+color+'">'+st+'</b>';
+    if(t.loop && (t.status==='running' || t.status==='pending')){ h += ' 已尝试 '+(t.tries||0)+' 次'; }
+    if(t.loop && t.note){ h += '<br><span class="muted" style="font-size:12px">'+t.note+'</span>'; }
+    if(t.status==='pending' || t.status==='running'){
+      h += ' <a href="#" onclick="cancelSubmit(\''+t.id+'\');return false;" style="color:var(--red)">取消</a>';
+    }
+    if(t.result && t.result.order_id){ h += ' 单号:'+t.result.order_id; }
+    h += '</li>';
+  }
+  el.innerHTML = h;
+}
+async function refreshTasks(){
+  try{ const d = await api('/api/submit_tasks', {}); renderTasks(d); }
+  catch(e){ console.log(e); }
+}
+async function saveNotify(){
+  const k = (document.getElementById('scKey').value||'').trim();
+  const h = document.getElementById('notify-hint');
+  try{
+    const d = await api('/api/notify_config', {serverchan_key: k});
+    h.textContent = d.ok ? (d.configured ? '✅ 已保存，抢到会推微信' : '已清空配置') : ('❌ '+JSON.stringify(d));
+  }catch(e){ h.textContent = '错误：'+e; }
+}
+async function testNotify(){
+  const h = document.getElementById('notify-hint');
+  h.textContent = '推送中…';
+  try{
+    const d = await api('/api/notify_config', {test: true});
+    h.textContent = d.ok ? '📱 测试推送已发送，请查收微信' : ('❌ '+(d.error||JSON.stringify(d)));
+  }catch(e){ h.textContent = '错误：'+e; }
+}
+async function loadNotify(){
+  try{
+    const d = await api('/api/notify_config', {});
+    if(d.ok && d.configured){
+      document.getElementById('notify-hint').textContent = '当前已配置：'+d.serverchan_key;
+    }
+  }catch(e){}
+}
+async function cancelSubmit(id){
+  if(!id) return;
+  if(!confirm('取消定时任务 '+id+'？')) return;
+  try{
+    const d = await api('/api/submit_cancel', {task_id:id});
+    alert(d.ok ? '已取消' : ('失败: '+(d.error||'')));
+    refreshTasks();
+  }catch(e){ alert('错误：'+e); }
+}
+refreshStatus();
+refreshTasks();
+loadAccounts();
+loadNotify();
+// 状态与任务自动轮询，无需手动刷新
+setInterval(refreshStatus, 3000);
+setInterval(refreshTasks, 5000);
+</script>
+</body>
+</html>
