@@ -105,3 +105,12 @@ python jd_gui_server.py
 ## 免责声明
 
 本工具仅供学习研究，请遵守京东用户协议与相关法规。下单为真实交易，请自行评估风险，作者不对使用后果负责。
+
+## Java 版（Spring Boot）
+
+`jd-seckill-java/` 是本项目 Python 版的 **1:1 对等重写**（Spring Boot 2.7.18 + Java-WebSocket），
+功能、接口、前端完全一致。详见 [jd-seckill-java/README.md](jd-seckill-java/README.md)。
+
+- 部署条件：JRE 8、本机已装 Google Chrome、端口 8899（与 Python 版互斥）。
+- 与 Python 版共享登录态（`chrome_jd/`）与推送配置（`jd_notify.json`），须在 `jd-seckill/jd-seckill-java/` 内运行。
+- 当前实现为 Windows 专属（Chrome 路径与进程启动按 Windows 写法）。
