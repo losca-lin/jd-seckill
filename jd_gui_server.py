@@ -190,8 +190,13 @@ def _fire(sku, qty, concurrency, retries):
 
 
 def _run_scheduled(task):
-    """定时线程：睡到目标时间 → 开火。可被取消标记中断。"""
+    """定时线程：睡到目标时间 → 开火（单次或循环到抢到为止）。可被取消标记中断。"""
     tid = task["id"]
+    loop = task.get("loop", False)
+    interval = max(0.5, float(task.get("interval", 2)))
+    max_tries = int(task.get("max_tries", 0))  # 0 = 无限循环直到抢到/取消
+
+    # 1) 等待到点
     delay = (task["at"] - datetime.now()).total_seconds()
     slept = 0.0
     while slept < delay:
@@ -208,11 +213,68 @@ def _run_scheduled(task):
             SCHEDULED[tid]["status"] = "cancelled"
             SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
             return
-        SCHEDULED[tid]["status"] = "running"
-    res = browser_call(_fire, task["sku"], task["qty"], task["concurrency"], task["retries"], timeout=80)
-    with SCHED_LOCK:
-        SCHEDULED[tid]["status"] = "done" if res.get("ok") else "error"
-        SCHEDULED[tid]["result"] = res
+
+    # 2) 单次模式（与原逻辑一致）
+    if not loop:
+        with SCHED_LOCK:
+            SCHEDULED[tid]["status"] = "running"
+        res = browser_call(_fire, task["sku"], task["qty"], task["concurrency"], task["retries"], timeout=80)
+        with SCHED_LOCK:
+            SCHEDULED[tid]["status"] = "done" if res.get("ok") else "error"
+            SCHEDULED[tid]["result"] = res
+        return
+
+    # 3) 循环模式：到点后每 interval 秒一次 checkout+submit，直到抢到/取消/达上限
+    tries = 0
+    risk_streak = 0
+    last_err = ""
+    while True:
+        with SCHED_LOCK:
+            if SCHEDULED.get(tid, {}).get("cancelled"):
+                SCHEDULED[tid]["status"] = "cancelled"
+                SCHEDULED[tid]["result"] = {"ok": False, "error": "已取消"}
+                return
+        tries += 1
+        with SCHED_LOCK:
+            SCHEDULED[tid]["tries"] = tries
+            SCHEDULED[tid]["status"] = "running"
+        # 每轮先打开结算页并读取风控状态（checkout 自带 risk_control 检测）
+        chk = browser_call(jd.checkout, task["sku"], task["qty"], timeout=40)
+        if chk.get("ok"):
+            if chk.get("risk_control"):
+                # 京东风控：拉长暂停，避免加重风控
+                risk_streak += 1
+                pause = min(30.0, interval * 4 * risk_streak)
+                note = f"⚠️ 账号被风控拦截，暂停 {pause:.0f}s 后重试（已尝试 {tries} 次）"
+                last_err = chk.get("text_snippet") or chk.get("error") or ""
+            else:
+                # 未风控 → 真实提交（复用刚打开的结算页）
+                sub = browser_call(jd.submit_order, task["sku"], task["qty"], False, timeout=40)
+                if sub.get("ok"):
+                    with SCHED_LOCK:
+                        SCHEDULED[tid]["status"] = "done"
+                        SCHEDULED[tid]["result"] = sub
+                        SCHEDULED[tid]["tries"] = tries
+                    return
+                risk_streak = 0
+                pause = interval
+                note = f"第 {tries} 次未下单（{sub.get('error', '')}），{interval:.0f}s 后重试"
+                last_err = sub.get("error") or ""
+        else:
+            # 结算页都没打开（网络抖动/风控）
+            risk_streak = 0
+            pause = interval
+            note = f"第 {tries} 次结算页未打开（{chk.get('error', '')}），{interval:.0f}s 后重试"
+            last_err = chk.get("error") or ""
+        with SCHED_LOCK:
+            SCHEDULED[tid]["note"] = note
+            SCHEDULED[tid]["last_error"] = last_err
+        if max_tries > 0 and tries >= max_tries:
+            with SCHED_LOCK:
+                SCHEDULED[tid]["status"] = "error"
+                SCHEDULED[tid]["result"] = {"ok": False, "error": f"已达最大尝试次数 {max_tries}", "tries": tries}
+            return
+        time.sleep(pause)
 
 
 def schedule_submit(data):
@@ -220,23 +282,35 @@ def schedule_submit(data):
     qty = int(data.get("qty", 1))
     conc = max(1, int(data.get("concurrency", 1)))
     retries = max(0, int(data.get("retries", 0)))
+    loop = bool(data.get("loop", False))
+    interval = max(0.5, float(data.get("interval", 2)))
+    max_tries = max(0, int(data.get("max_tries", 0)))
     at = parse_schedule_time(data.get("at", ""))
     if at <= datetime.now():
         raise ValueError("定时必须晚于当前时间")
+    if loop:
+        # 循环模式本身就是「多次提交」，强制单笔（并发>1 会在每轮生成多订单）
+        conc = 1
     with SCHED_LOCK:
         _TASK_ID[0] += 1
         tid = f"T{_TASK_ID[0]:03d}"
         task = {
             "id": tid, "sku": sku, "qty": qty, "concurrency": conc,
-            "retries": retries, "at": at,
+            "retries": retries, "at": at, "loop": loop,
+            "interval": interval, "max_tries": max_tries, "tries": 0,
+            "note": "", "last_error": "",
             "at_str": at.strftime("%Y-%m-%d %H:%M:%S"),
             "status": "pending", "result": None,
             "created": datetime.now().strftime("%H:%M:%S"),
         }
         SCHEDULED[tid] = task
     threading.Thread(target=_run_scheduled, args=(task,), daemon=True).start()
-    return {"ok": True, "task_id": tid, "at": task["at_str"],
-            "message": f"已安排在 {task['at_str']} 提交（并发 {conc}，重试 {retries}）"}
+    if loop:
+        mode = f"循环抢购（每 {interval:.0f}s 一次，直到抢到；上限 {max_tries or '∞'} 次）"
+    else:
+        mode = f"单次提交（并发 {conc}，重试 {retries}）"
+    return {"ok": True, "task_id": tid, "at": task["at_str"], "loop": loop,
+            "message": f"已安排在 {task['at_str']} {mode}"}
 
 
 def list_tasks():
@@ -413,8 +487,18 @@ HTML = r"""<!DOCTYPE html>
     <div class="row" style="margin-top:14px;">
       <button class="danger buy-btn" id="btn-buy" onclick="doSubmit()">🚀 立即抢购</button>
       <button class="ghost" onclick="doCheckout()">仅打开结算页核对</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
       <input type="text" id="at4" placeholder="定时时间，如 20:00">
       <button class="ghost" onclick="scheduleSubmit()">⏰ 定时抢购</button>
+    </div>
+    <label class="switch" style="margin-top:10px;">
+      <input type="checkbox" id="loopChk" onchange="onLoopChange()"> 循环到抢到为止（到点后每间隔多次提交，直到抢到）
+    </label>
+    <div class="row" id="loop-opts" style="margin-top:8px; align-items:center; display:none;">
+      <span class="muted">循环间隔</span>
+      <input type="text" id="interval4" value="2" style="flex:0 0 64px;" title="每轮提交之间的最小间隔秒数；被京东风控时会自动拉长暂停">
+      <span class="muted">秒（京东风控时自动拉长暂停）</span>
     </div>
     <div class="note">⚠️ 立即抢购会真实提交订单并跳转收银台（<b>会产生订单需支付</b>）。并发数&gt;1 可能生成多笔订单；定时抢购到点由后台自动执行，关掉页面也不影响。</div>
     <div id="checkout-result" class="kv" style="margin-top:12px;"></div>
@@ -721,17 +805,23 @@ async function scheduleSubmit(){
   if(!at){ alert('请先填写定时时间，如 20:00 或 2026-07-22 20:00:00'); return; }
   const o = document.getElementById('out-submit');
   o.className=''; o.textContent='安排中…';
+  const loop = document.getElementById('loopChk').checked;
+  const interval = parseFloat(val('interval4')||'2') || 2;
   try{
     const d = await api('/api/submit_schedule', {
       sku: val('sku4')||'100342780502',
       qty: parseInt(val('qty4')||'1'),
       concurrency: parseInt(val('conc4')||'1'),
       retries: parseInt(val('retry4')||'0'),
-      at: at
+      at: at, loop: loop, interval: interval
     });
     o.textContent = JSON.stringify(d, null, 2);
     refreshTasks();
   }catch(e){ o.className='err'; o.textContent='错误：'+e; }
+}
+function onLoopChange(){
+  const box = document.getElementById('loop-opts');
+  if(box) box.style.display = document.getElementById('loopChk').checked ? 'flex' : 'none';
 }
 function renderTasks(d){
   const el = document.getElementById('tasks');
@@ -739,8 +829,11 @@ function renderTasks(d){
   let h='';
   for(const t of d.tasks){
     const st=t.status;
-    const color = st==='done'?'var(--green)':(st==='error'?'var(--red)':(st==='cancelled'?'#999':'var(--red)'));
-    h += '<li>#'+t.id+' @ '+t.at_str+' ['+t.sku+' ×'+t.qty+'] <b style="color:'+color+'">'+st+'</b>';
+    const color = st==='done'?'var(--green)':(st==='error'?'var(--red)':(st==='cancelled'?'#999':'var(--blue)'));
+    const loopTag = t.loop ? ' [循环]' : '';
+    h += '<li>#'+t.id+loopTag+' @ '+t.at_str+' ['+t.sku+' ×'+t.qty+'] <b style="color:'+color+'">'+st+'</b>';
+    if(t.loop && (t.status==='running' || t.status==='pending')){ h += ' 已尝试 '+(t.tries||0)+' 次'; }
+    if(t.loop && t.note){ h += '<br><span class="muted" style="font-size:12px">'+t.note+'</span>'; }
     if(t.status==='pending' || t.status==='running'){
       h += ' <a href="#" onclick="cancelSubmit(\''+t.id+'\');return false;" style="color:var(--red)">取消</a>';
     }
