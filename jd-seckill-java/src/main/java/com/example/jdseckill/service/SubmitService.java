@@ -31,12 +31,17 @@ public class SubmitService {
     private CheckoutService checkoutService;
 
     public Map<String, Object> submitOrder(String sku, int qty, boolean ensureCheckout, String targetId) {
+        log.info("[submit] 开始 sku={} qty={} ensureCheckout={} targetId={}", sku, qty, ensureCheckout, targetId);
         try {
             if (ensureCheckout) {
+                log.info("[submit] 需要重新打开结算页...");
                 Map<String, Object> chk = checkoutService.checkout(sku, qty, false);
                 if (!(Boolean) chk.getOrDefault("ok", false)) {
-                    return map("ok", false, "error", "打开结算页失败: " + chk.get("error"));
+                    String err = "打开结算页失败: " + chk.get("error");
+                    log.warn("[submit] {}", err);
+                    return map("ok", false, "error", err);
                 }
+                log.info("[submit] 结算页已重新打开");
             }
             Map<String, Object> page;
             if (targetId != null && !targetId.isEmpty()) {
@@ -45,13 +50,17 @@ public class SubmitService {
                 page = chrome.findPage("trade.m.jd.com/pay");
             }
             if (page == null) {
-                return map("ok", false, "error", "未找到结算页，请先执行 checkout");
+                String err = "未找到结算页，请先执行 checkout";
+                log.warn("[submit] {}", err);
+                return map("ok", false, "error", err);
             }
+            log.info("[submit] 命中结算页 id={} url={}", page.get("id"), page.get("url"));
             CdpClient pg = new CdpClient(java.net.URI.create(String.valueOf(page.get("webSocketDebuggerUrl"))));
             pg.connectBlocking(10, java.util.concurrent.TimeUnit.SECONDS);
             pg.enableDomains();
             if (targetId != null && !targetId.isEmpty()) {
                 try {
+                    log.info("[submit] 预热页 reload 刷新到最新态...");
                     pg.reload();
                     Thread.sleep(1500);
                 } catch (Exception ignored) {
@@ -64,6 +73,7 @@ public class SubmitService {
                     baseline.add(String.valueOf(p.get("url")));
                 }
             }
+            log.info("[submit] baseline 已有收银台数量={}", baseline.size());
             Map<String, Object> btn = pg.evalMap("(() => {\n"
                     + "  let e=document.querySelector('taro-button-core[class*=\"ActionBar_submit\"]')\n"
                     + "    || document.querySelector('[class*=\"ActionBar_submit\"]');\n"
@@ -84,10 +94,15 @@ public class SubmitService {
                     pg.close();
                 } catch (Exception ignored) {
                 }
-                return map("ok", false, "error", "未找到 ActionBar_submit 提交按钮");
+                String err = "未找到 ActionBar_submit 提交按钮（结算页可能未加载完 / 无货态 / 需勾选协议）";
+                log.warn("[submit] {}", err);
+                return map("ok", false, "error", err);
             }
+            log.info("[submit] 找到提交按钮 tag={} cls={} txt=[{}] 坐标=({},{}))",
+                    btn.get("tag"), btn.get("cls"), btn.get("txt"), btn.get("x"), btn.get("y"));
             int x = ((Number) btn.get("x")).intValue();
             int y = ((Number) btn.get("y")).intValue();
+            log.info("[submit] 真实鼠标点击坐标 ({},{})", x, y);
             dispatchMouse(pg, x, y);
 
             boolean jumped = false;
@@ -100,6 +115,7 @@ public class SubmitService {
                 }
             }
             if (!jumped) {
+                log.warn("[submit] 鼠标点击后 1.2s 内未出现新收银台，改用 DOM .click() 兜底");
                 // DOM .click() 兜底
                 try {
                     pg.eval("(() => {\n"
@@ -111,6 +127,8 @@ public class SubmitService {
                             + "})()");
                 } catch (Exception ignored) {
                 }
+            } else {
+                log.info("[submit] 鼠标点击后已跳转到新收银台");
             }
             String orderId = null;
             String payUrl = "";
@@ -150,6 +168,9 @@ public class SubmitService {
                     } catch (Exception ignored) {
                     }
                 }
+                if (i % 10 == 0) {
+                    log.info("[submit] 等待收银台/订单号... 第{}次 url={}", i, url);
+                }
             }
             if (orderId == null) {
                 try {
@@ -161,17 +182,29 @@ public class SubmitService {
                 }
             }
             try {
+                // 失败时额外抓一次结算页实际文案，便于排查“无货/风控/需勾选协议”
+                if (orderId == null) {
+                    String bodyText = pg.evalString("document.body.innerText");
+                    log.warn("[submit] 20s 内未生成订单。结算页文案前 400 字: {}",
+                            bodyText == null ? "(取不到)" : bodyText.replaceAll("\\s+", " ").substring(0, Math.min(400, bodyText.length())));
+                }
+            } catch (Exception ignored) {
+            }
+            try {
                 pg.close();
             } catch (Exception ignored) {
             }
             if (orderId != null) {
+                log.info("[submit] 成功！order_id={} payment_url={}", orderId, payUrl);
                 return map("ok", true, "order_id", orderId, "payment_url", payUrl);
             }
+            String err = "点击提交后未生成新订单（未跳转到收银台）。可能原因：秒杀已无库存 / 京东风控拦截 / 需先勾选购买协议。请查看浏览器结算页实际状态";
+            log.warn("[submit] {} | payment_url={}", err, payUrl);
             return map("ok", false,
-                    "error", "点击提交后未生成新订单（未跳转到收银台）。可能原因：秒杀已无库存 / 京东风控拦截 / 需先勾选购买协议。请查看浏览器结算页实际状态",
+                    "error", err,
                     "payment_url", payUrl);
         } catch (Exception e) {
-            log.warn("submit_order 异常: {}", e.getMessage());
+            log.error("[submit] submit_order 异常", e);
             return map("ok", false, "error", e.getMessage());
         }
     }

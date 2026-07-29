@@ -47,6 +47,11 @@ public class ScheduleService {
         boolean loop = Boolean.parseBoolean(String.valueOf(data.get("loop")));
         double interval = Math.max(0.5, toDouble(data.get("interval"), 2));
         int maxTries = Math.max(0, toInt(data.get("max_tries"), 0));
+        int stopAfter = Math.max(0, toInt(data.get("stop_after_minutes"), 0));
+        if (loop && maxTries == 0 && stopAfter == 0) {
+            stopAfter = 10;
+            log.warn("[schedule] loop 任务未显式设置 max_tries / stop_after_minutes，启用安全网：到点后最多刷 10 分钟自动停止");
+        }
         boolean prep = Boolean.parseBoolean(String.valueOf(data.get("prep")));
         int prepSeconds = Math.max(1, toInt(data.get("prep_seconds"), 3));
         Date at;
@@ -73,6 +78,7 @@ public class ScheduleService {
         task.put("loop", loop);
         task.put("interval", interval);
         task.put("max_tries", maxTries);
+        task.put("stop_after_minutes", stopAfter);
         task.put("tries", 0);
         task.put("prep", prep);
         task.put("prep_seconds", prepSeconds);
@@ -84,7 +90,8 @@ public class ScheduleService {
         scheduled.put(tid, task);
         new Thread(() -> runScheduled(task), "schedule-" + tid).start();
         String mode = loop
-                ? "循环抢购（每 " + (int) interval + "s 一次，直到抢到；上限 " + (maxTries == 0 ? "∞" : maxTries) + " 次）"
+                ? "循环抢购（每 " + (int) interval + "s 一次，直到抢到；上限 " + (maxTries == 0 ? "∞" : maxTries)
+                  + " 次，到点后最多刷 " + stopAfter + " 分钟）"
                 : "单次提交（并发 " + conc + "，重试 " + retries + "）";
         return map("ok", true, "task_id", tid, "at", task.get("at_str"), "loop", loop,
                 "message", "已安排在 " + task.get("at_str") + " " + mode);
@@ -124,11 +131,14 @@ public class ScheduleService {
         boolean loop = Boolean.parseBoolean(String.valueOf(task.get("loop")));
         double interval = toDouble(task.get("interval"), 2);
         int maxTries = toInt(task.get("max_tries"), 0);
+        int stopAfter = toInt(task.get("stop_after_minutes"), 0);
         String sku = String.valueOf(task.get("sku"));
         int qty = toInt(task.get("qty"), 1);
         int conc = toInt(task.get("concurrency"), 1);
         int retries = toInt(task.get("retries"), 0);
         long at = ((Number) task.get("at")).longValue();
+        log.info("[task {}] 启动 sku={} qty={} loop={} interval={}s maxTries={} conc={} retries={} at={}",
+                tid, sku, qty, loop, interval, maxTries, conc, retries, task.get("at_str"));
 
         // 1) 预热 + 等待到点
         String prepTarget = null;
@@ -136,10 +146,12 @@ public class ScheduleService {
             int prepSeconds = toInt(task.get("prep_seconds"), 3);
             long prepAt = at - prepSeconds * 1000L;
             long prepWait = prepAt - System.currentTimeMillis();
+            log.info("[task {}] 预热模式：提前 {}s 打开结算页（剩余等待 {}ms）", tid, prepSeconds, Math.max(0, prepWait));
             if (prepWait > 0) {
                 double pw = 0;
                 while (pw < prepWait) {
                     if (cancelled(tid)) {
+                        log.info("[task {}] 预热等待期间被取消", tid);
                         return;
                     }
                     double step = Math.min(1000, prepWait - pw);
@@ -152,17 +164,23 @@ public class ScheduleService {
                         () -> checkoutService.checkout(sku, qty, true), 40);
                 if (Boolean.parseBoolean(String.valueOf(pr.getOrDefault("ok", false)))) {
                     prepTarget = String.valueOf(pr.get("target_id"));
+                    log.info("[task {}] 预热结算页已打开 targetId={}", tid, prepTarget);
+                } else {
+                    log.warn("[task {}] 预热打开结算页失败: {}", tid, pr.get("error"));
                 }
             } catch (Exception e) {
                 prepTarget = null;
+                log.warn("[task {}] 预热异常: {}", tid, e.getMessage());
             }
         }
         final String prepTargetFinal = prepTarget;
         long delay = at - System.currentTimeMillis();
         if (delay > 0) {
+            log.info("[task {}] 距离开抢还有 {}ms，开始倒计时等待", tid, delay);
             double slept = 0;
             while (slept < delay) {
                 if (cancelled(tid)) {
+                    log.info("[task {}] 倒计时期间被取消", tid);
                     return;
                 }
                 double step = Math.min(1000, delay - slept);
@@ -173,22 +191,28 @@ public class ScheduleService {
         if (cancelled(tid)) {
             return;
         }
+        log.info("[task {}] 到点！开始提交", tid);
+        long fireTime = System.currentTimeMillis();
 
         // 2) 单次模式
         if (!loop) {
             setStatus(tid, "running");
             Map<String, Object> res;
             if (prepTarget != null) {
+                log.info("[task {}] 单次模式：复用预热页直接提交", tid);
                 res = chrome.run(() -> submitService.submitOrder(sku, qty, false, prepTargetFinal), 40);
                 if (!Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false)))) {
+                    log.warn("[task {}] 预热页提交失败，转为常规流程: {}", tid, res.get("error"));
                     res = chrome.run(() -> fire(sku, qty, conc, retries), 80);
                 }
             } else {
                 res = chrome.run(() -> fire(sku, qty, conc, retries), 80);
             }
-            setStatus(tid, Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false))) ? "done" : "error");
+            boolean ok = Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false)));
+            log.info("[task {}] 单次提交结束 ok={} order_id={} error={}", tid, ok, res.get("order_id"), res.get("error"));
+            setStatus(tid, ok ? "done" : "error");
             setResult(tid, res);
-            if (Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false)))) {
+            if (ok) {
                 notifySuccess(task, res);
             }
             return;
@@ -197,8 +221,10 @@ public class ScheduleService {
         // 3) 循环模式：先打预热一枪
         if (prepTarget != null) {
             setStatus(tid, "running");
+            log.info("[task {}] 循环模式：先打预热一枪", tid);
             Map<String, Object> sp = chrome.run(() -> submitService.submitOrder(sku, qty, false, prepTargetFinal), 40);
             if (Boolean.parseBoolean(String.valueOf(sp.getOrDefault("ok", false)))) {
+                log.info("[task {}] 预热一枪抢到！order_id={}", tid, sp.get("order_id"));
                 synchronized (schedLock) {
                     Map<String, Object> t = scheduled.get(tid);
                     if (t != null) {
@@ -209,6 +235,8 @@ public class ScheduleService {
                 }
                 notifySuccess(task, sp);
                 return;
+            } else {
+                log.warn("[task {}] 预热一枪未中: {}，进入循环", tid, sp.get("error"));
             }
         }
         int tries = 0;
@@ -216,6 +244,19 @@ public class ScheduleService {
         String lastErr = "";
         while (true) {
             if (cancelled(tid)) {
+                log.info("[task {}] 循环期间被取消", tid);
+                return;
+            }
+            if (stopAfter > 0 && System.currentTimeMillis() - fireTime > stopAfter * 60000L) {
+                log.warn("[task {}] 到点后已刷 {} 分钟仍未抢到，自动停止（共 {} 次）", tid, stopAfter, tries);
+                synchronized (schedLock) {
+                    Map<String, Object> t = scheduled.get(tid);
+                    if (t != null) {
+                        t.put("status", "error");
+                        t.put("result", map("ok", false, "error",
+                                "到点后已刷 " + stopAfter + " 分钟仍未抢到，自动停止", "tries", tries));
+                    }
+                }
                 return;
             }
             tries++;
@@ -229,9 +270,11 @@ public class ScheduleService {
                     double pause = Math.min(30.0, interval * 4 * riskStreak);
                     note = "⚠️ 账号被风控拦截，暂停 " + (int) pause + "s 后重试（已尝试 " + tries + " 次）";
                     lastErr = String.valueOf(chk.getOrDefault("text_snippet", chk.getOrDefault("error", "")));
+                    log.warn("[task {}] 第{}次 风控拦截，暂停{}s | 文案: {}", tid, tries, (int) pause, lastErr);
                 } else {
                     Map<String, Object> sub = chrome.run(() -> submitService.submitOrder(sku, qty, false, null), 40);
                     if (Boolean.parseBoolean(String.valueOf(sub.getOrDefault("ok", false)))) {
+                        log.info("[task {}] 第{}次 抢到！order_id={}", tid, tries, sub.get("order_id"));
                         synchronized (schedLock) {
                             Map<String, Object> t = scheduled.get(tid);
                             if (t != null) {
@@ -246,14 +289,17 @@ public class ScheduleService {
                     riskStreak = 0;
                     note = "第 " + tries + " 次未下单（" + sub.get("error") + "），" + (int) interval + "s 后重试";
                     lastErr = String.valueOf(sub.getOrDefault("error", ""));
+                    log.info("[task {}] 第{}次 未下单: {}", tid, tries, sub.get("error"));
                 }
             } else {
                 riskStreak = 0;
                 note = "第 " + tries + " 次结算页未打开（" + chk.get("error") + "），" + (int) interval + "s 后重试";
                 lastErr = String.valueOf(chk.getOrDefault("error", ""));
+                log.warn("[task {}] 第{}次 结算页未打开: {}", tid, tries, chk.get("error"));
             }
             setNote(tid, note, lastErr);
             if (maxTries > 0 && tries >= maxTries) {
+                log.warn("[task {}] 已达最大尝试次数 {}，停止", tid, maxTries);
                 synchronized (schedLock) {
                     Map<String, Object> t = scheduled.get(tid);
                     if (t != null) {
@@ -272,6 +318,7 @@ public class ScheduleService {
         if (concurrency <= 1) {
             return doSubmit(sku, qty, retries);
         }
+        log.info("[fire] 并发模式 conc={} qty={}：先打开结算页", concurrency, qty);
         try {
             Map<String, Object> chk = checkoutService.checkout(sku, qty, false);
             if (!(Boolean) chk.getOrDefault("ok", false)) {
@@ -284,6 +331,7 @@ public class ScheduleService {
             if (i > 0) {
                 sleep((long) (150 * i));
             }
+            log.info("[fire] 并发第 {} 发", i + 1);
             Map<String, Object> r = submitService.submitOrder(sku, qty, false, null);
             if (Boolean.parseBoolean(String.valueOf(r.getOrDefault("ok", false)))) {
                 return r;
@@ -295,14 +343,17 @@ public class ScheduleService {
     private Map<String, Object> doSubmit(String sku, int qty, int retries) {
         Map<String, Object> last = null;
         int attempts = 1 + Math.max(0, retries);
+        log.info("[doSubmit] 单发+重试 qty={} retries={}（共{}次）", qty, retries, attempts);
         for (int attempt = 0; attempt < attempts; attempt++) {
             Map<String, Object> r = submitService.submitOrder(sku, qty, attempt > 0, null);
             if (Boolean.parseBoolean(String.valueOf(r.getOrDefault("ok", false)))) {
                 return r;
             }
+            log.info("[doSubmit] 第{}次未成功: {}", attempt + 1, r.get("error"));
             last = r;
         }
         if (retries == 0 && last != null && !Boolean.parseBoolean(String.valueOf(last.getOrDefault("ok", false)))) {
+            log.info("[doSubmit] 单发未中，最后再 ensure_checkout 重试一次");
             Map<String, Object> r = submitService.submitOrder(sku, qty, true, null);
             if (Boolean.parseBoolean(String.valueOf(r.getOrDefault("ok", false)))) {
                 return r;

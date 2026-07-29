@@ -51,8 +51,9 @@ public class ApiController {
     }
 
     @PostMapping("/api/status")
-    public Map<String, Object> status(@RequestBody Map<String, Object> data) {
-        boolean force = Boolean.parseBoolean(String.valueOf(data.getOrDefault("force", false)));
+    public Map<String, Object> status(@RequestBody(required = false) Map<String, Object> data) {
+        final boolean force = data != null
+                && Boolean.parseBoolean(String.valueOf(data.getOrDefault("force", false)));
         return chrome.run(() -> chrome.chromeStatus(force), 30);
     }
 
@@ -105,6 +106,7 @@ public class ApiController {
         int qty = toInt(data.get("qty"), 1);
         int conc = Math.max(1, toInt(data.get("concurrency"), 1));
         int retries = Math.max(0, toInt(data.get("retries"), 0));
+        log.info("[API] 立即抢购请求 sku={} qty={} concurrency={} retries={}", sku, qty, conc, retries);
         Map<String, Object> res;
         if (conc <= 1) {
             // 单次+重试：优先复用已有结算页（最快），失败再 ensure_checkout
@@ -137,7 +139,10 @@ public class ApiController {
             }, 80);
         }
         // 抢到即推微信（立即抢购也会触发，与定时任务一致）
-        if (Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false)))) {
+        boolean ok = Boolean.parseBoolean(String.valueOf(res.getOrDefault("ok", false)));
+        log.info("[API] 立即抢购结果 sku={} ok={} order_id={} error={}",
+                sku, ok, res.get("order_id"), res.get("error"));
+        if (ok) {
             Map<String, Object> task = new LinkedHashMap<>();
             task.put("sku", sku);
             task.put("qty", qty);

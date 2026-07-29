@@ -49,6 +49,7 @@ public class CheckoutService {
     private ChromeManager chrome;
 
     public Map<String, Object> checkout(String sku, int qty, boolean keepOpen) {
+        log.info("[checkout] 开始 sku={} qty={} keepOpen={}", sku, qty, keepOpen);
         try {
             String payUrl = "https://trade.m.jd.com/pay?commlist=" + sku + ",," + qty + "," + sku + ",1,0,0";
             // 关掉旧的结算页 tab（可能卡死），避免复用失效连接
@@ -60,6 +61,7 @@ public class CheckoutService {
                 }
             }
             PageSession ps = chrome.openPage(payUrl, true);
+            log.info("[checkout] 已打开结算页 targetId={} url={}", ps.targetId, payUrl);
             CdpClient pg = ps.client;
             // 独立连接监听 Network 事件，拦截结算数据接口 JSON 响应
             String lws = chrome.pageWsByTarget(ps.targetId, 12);
@@ -94,6 +96,7 @@ public class CheckoutService {
                     continue;
                 }
                 if (isRiskControl(html, txt)) {
+                    log.warn("[checkout] 检测到风控拦截文案（活动异常火爆），终止等待");
                     break;
                 }
                 if (html != null && html.length() > 3000) {
@@ -110,6 +113,7 @@ public class CheckoutService {
 
             Map<String, Object> info;
             if (apiBody.data != null) {
+                log.info("[checkout] 接口数据拦截成功 funcId={} 长度={}", apiBody.fid, apiBody.data.length());
                 try {
                     JsonNode parsed = new com.fasterxml.jackson.databind.ObjectMapper().readTree(apiBody.data);
                     info = parseCheckoutApi(parsed, sku, qty);
@@ -119,6 +123,7 @@ public class CheckoutService {
                     info = null;
                 }
             } else {
+                log.warn("[checkout] 25s 内未拦截到结算接口数据，改用 DOM 解析兜底");
                 info = null;
             }
             if (info == null || info.get("product_name") == null) {
@@ -140,6 +145,9 @@ public class CheckoutService {
             } else {
                 info.put("risk_control", false);
             }
+            log.info("[checkout] 结果 source={} 商品={} 单价={} 数量={} 地址={} 风控={} ready={}",
+                    info.get("source"), info.get("product_name"), info.get("price"),
+                    info.get("qty_found"), info.get("address_hint"), info.get("risk_control"), ready);
             try {
                 if (listen != null) {
                     listen.close();
@@ -161,7 +169,7 @@ public class CheckoutService {
             }
             return info;
         } catch (Exception e) {
-            log.warn("checkout 异常: {}", e.getMessage());
+            log.error("[checkout] checkout 异常", e);
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("ok", false);
             r.put("error", e.getMessage());
